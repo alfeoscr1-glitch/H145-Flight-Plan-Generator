@@ -1,56 +1,47 @@
 using System;
-using System.Speech.Recognition;
+using Microsoft.CognitiveServices.Speech;
+using Microsoft.CognitiveServices.Speech.Audio;
 
 namespace H145FlightPlanner.Speech
 {
     public class SpeechService
     {
-        private readonly SpeechRecognitionEngine _recognizer;
+        private SpeechRecognizer? _recognizer;
 
         public event EventHandler<string>? SpeechRecognized;
         public event EventHandler<string>? SpeechError;
 
-        public SpeechService()
+        public async void StartListening()
         {
             try
             {
-                _recognizer = new SpeechRecognitionEngine();
+                string key = SpeechConfiguration.SpeechKey;
+                string region = SpeechConfiguration.SpeechRegion;
 
-                // Use the Windows microphone selected as the default input device.
-                _recognizer.SetInputToDefaultAudioDevice();
+                if (string.IsNullOrWhiteSpace(key) ||
+                    string.IsNullOrWhiteSpace(region))
+                {
+                    SpeechError?.Invoke(
+                        this,
+                        "Azure Speech is not configured yet.");
+                    return;
+                }
 
-                // Allow normal free-form speech.
-                _recognizer.LoadGrammar(new DictationGrammar());
+                var speechConfig =
+                    SpeechConfig.FromSubscription(key, region);
 
-                _recognizer.SpeechRecognized += OnSpeechRecognized;
-                _recognizer.SpeechRecognitionRejected += OnSpeechRecognitionRejected;
-            }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException(
-                    "The Windows speech recognition system could not be started.",
-                    ex);
-            }
-        }
+                speechConfig.SpeechRecognitionLanguage = "en-GB";
 
-        public void StartListening()
-        {
-            try
-            {
-                _recognizer.RecognizeAsyncCancel();
-                _recognizer.RecognizeAsync(RecognizeMode.Multiple);
-            }
-            catch (Exception ex)
-            {
-                SpeechError?.Invoke(this, ex.Message);
-            }
-        }
+                using var audioConfig =
+                    AudioConfig.FromDefaultMicrophoneInput();
 
-        public void StopListening()
-        {
-            try
-            {
-                _recognizer.RecognizeAsyncCancel();
+                _recognizer = new SpeechRecognizer(
+                    speechConfig,
+                    audioConfig);
+
+                _recognizer.Recognized += Recognizer_Recognized;
+
+                await _recognizer.StartContinuousRecognitionAsync();
             }
             catch (Exception ex)
             {
@@ -58,23 +49,41 @@ namespace H145FlightPlanner.Speech
             }
         }
 
-        private void OnSpeechRecognized(
+        public async void StopListening()
+        {
+            try
+            {
+                if (_recognizer == null)
+                    return;
+
+                await _recognizer.StopContinuousRecognitionAsync();
+
+                _recognizer.Recognized -= Recognizer_Recognized;
+                _recognizer.Dispose();
+                _recognizer = null;
+            }
+            catch (Exception ex)
+            {
+                SpeechError?.Invoke(this, ex.Message);
+            }
+        }
+
+        private void Recognizer_Recognized(
             object? sender,
-            SpeechRecognizedEventArgs e)
+            SpeechRecognitionEventArgs e)
         {
-            if (e.Result == null || string.IsNullOrWhiteSpace(e.Result.Text))
+            if (e.Result == null)
                 return;
 
-            string recognisedText = e.Result.Text.Trim();
+            if (e.Result.Reason != ResultReason.RecognizedSpeech)
+                return;
 
-            SpeechRecognized?.Invoke(this, recognisedText);
-        }
+            string text = e.Result.Text?.Trim() ?? string.Empty;
 
-        private void OnSpeechRecognitionRejected(
-            object? sender,
-            SpeechRecognitionRejectedEventArgs e)
-        {
-            // Ignore speech that the recognizer cannot understand.
+            if (string.IsNullOrWhiteSpace(text))
+                return;
+
+            SpeechRecognized?.Invoke(this, text);
         }
     }
 }
