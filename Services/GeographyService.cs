@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
@@ -31,6 +33,8 @@ namespace H145FlightPlanner.Services
 
         public string PlaceType { get; set; } = string.Empty;
 
+        public string Category { get; set; } = string.Empty;
+
         public bool HasBoundingBox =>
             NorthLatitude > SouthLatitude &&
             EastLongitude > WestLongitude;
@@ -59,14 +63,18 @@ namespace H145FlightPlanner.Services
             if (string.IsNullOrWhiteSpace(placeName))
                 return null;
 
-            string query =
-                Uri.EscapeDataString(placeName.Trim());
+            string cleanedName = placeName.Trim();
 
+            string query =
+                Uri.EscapeDataString(cleanedName);
+
+            // Ask for several possibilities instead of blindly
+            // accepting the first OpenStreetMap result.
             string url =
                 $"https://nominatim.openstreetmap.org/search" +
                 $"?q={query}" +
                 $"&format=jsonv2" +
-                $"&limit=1" +
+                $"&limit=10" +
                 $"&addressdetails=1";
 
             using HttpResponseMessage response =
@@ -83,17 +91,26 @@ namespace H145FlightPlanner.Services
             using JsonDocument document =
                 JsonDocument.Parse(json);
 
-            if (document.RootElement.ValueKind !=
-                JsonValueKind.Array)
-            {
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
                 return null;
-            }
 
             if (document.RootElement.GetArrayLength() == 0)
                 return null;
 
-            JsonElement result =
-                document.RootElement[0];
+            var results = new List<JsonElement>();
+
+            foreach (JsonElement element in document.RootElement.EnumerateArray())
+            {
+                results.Add(element.Clone());
+            }
+
+            JsonElement? selected =
+                SelectBestPlaceResult(results);
+
+            if (selected == null)
+                return null;
+
+            JsonElement result = selected.Value;
 
             if (!TryGetDouble(
                 result,
@@ -113,7 +130,7 @@ namespace H145FlightPlanner.Services
 
             var geographyResult = new GeographyResult
             {
-                Name = placeName.Trim(),
+                Name = cleanedName,
 
                 DisplayName =
                     GetString(result, "display_name"),
@@ -129,7 +146,10 @@ namespace H145FlightPlanner.Services
                     GetLong(result, "osm_id"),
 
                 PlaceType =
-                    GetString(result, "type")
+                    GetString(result, "type"),
+
+                Category =
+                    GetString(result, "category")
             };
 
             ReadBoundingBox(
@@ -137,6 +157,101 @@ namespace H145FlightPlanner.Services
                 geographyResult);
 
             return geographyResult;
+        }
+
+        private static JsonElement? SelectBestPlaceResult(
+            List<JsonElement> results)
+        {
+            if (results.Count == 0)
+                return null;
+
+            // -------------------------------------------------
+            // PRIORITY 1:
+            // Actual populated places.
+            // -------------------------------------------------
+
+            string[] preferredPlaceTypes =
+            {
+                "city",
+                "town",
+                "village",
+                "hamlet",
+                "municipality",
+                "borough",
+                "suburb",
+                "quarter",
+                "neighbourhood",
+                "locality"
+            };
+
+            foreach (string preferredType in preferredPlaceTypes)
+            {
+                JsonElement? match =
+                    results.FirstOrDefaultNullable(
+                        result =>
+                            IsPlaceCategory(result) &&
+                            string.Equals(
+                                GetString(result, "type"),
+                                preferredType,
+                                StringComparison.OrdinalIgnoreCase));
+
+                if (match != null)
+                    return match;
+            }
+
+            // -------------------------------------------------
+            // PRIORITY 2:
+            // Other OSM objects classified as a place.
+            // -------------------------------------------------
+
+            foreach (JsonElement result in results)
+            {
+                if (IsPlaceCategory(result))
+                    return result;
+            }
+
+            // -------------------------------------------------
+            // PRIORITY 3:
+            // Administrative boundaries can represent cities,
+            // towns and other named areas.
+            // -------------------------------------------------
+
+            foreach (JsonElement result in results)
+            {
+                string category =
+                    GetString(result, "category");
+
+                if (string.Equals(
+                    category,
+                    "boundary",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return result;
+                }
+            }
+
+            // -------------------------------------------------
+            // FALLBACK:
+            // If there genuinely isn't a settlement result,
+            // allow the best normal Nominatim result.
+            //
+            // This means an explicitly searched helipad,
+            // heliport, landmark, etc. can still work.
+            // -------------------------------------------------
+
+            return results[0];
+        }
+
+        private static bool IsPlaceCategory(
+            JsonElement result)
+        {
+            string category =
+                GetString(result, "category");
+
+            return string.Equals(
+                category,
+                "place",
+                StringComparison.OrdinalIgnoreCase);
         }
 
         private static void ReadBoundingBox(
@@ -252,6 +367,22 @@ namespace H145FlightPlanner.Services
             }
 
             return 0;
+        }
+    }
+
+    internal static class JsonElementExtensions
+    {
+        public static JsonElement? FirstOrDefaultNullable(
+            this IEnumerable<JsonElement> source,
+            Func<JsonElement, bool> predicate)
+        {
+            foreach (JsonElement item in source)
+            {
+                if (predicate(item))
+                    return item;
+            }
+
+            return null;
         }
     }
 }
