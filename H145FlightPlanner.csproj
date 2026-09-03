@@ -17,6 +17,7 @@
 
   <ItemGroup>
     <PackageReference Include="Whisper.net.AllRuntimes" Version="1.9.1" />
+    <PackageReference Include="NAudio" Version="2.2.1" />
   </ItemGroup>
 
 </Project>
