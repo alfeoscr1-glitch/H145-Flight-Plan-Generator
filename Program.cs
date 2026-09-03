@@ -1,6 +1,5 @@
 using System;
 using System.Drawing;
-using System.IO;
 using System.Text;
 using System.Windows.Forms;
 using H145FlightPlanner.Export;
@@ -26,7 +25,9 @@ namespace H145FlightPlanner
     {
         private readonly WhisperSpeechService _whisperService;
         private readonly AirportService _airportService;
+        private readonly GeographyService _geographyService;
         private readonly DirectRouteGenerator _directRouteGenerator;
+        private readonly OrbitRouteGenerator _orbitRouteGenerator;
 
         private readonly TextBox _commandBox;
         private readonly Button _microphoneButton;
@@ -48,9 +49,15 @@ namespace H145FlightPlanner
             _whisperService = new WhisperSpeechService();
 
             _airportService = new AirportService();
+            _geographyService = new GeographyService();
 
             _directRouteGenerator =
                 new DirectRouteGenerator(_airportService);
+
+            _orbitRouteGenerator =
+                new OrbitRouteGenerator(
+                    _airportService,
+                    _geographyService);
 
             _whisperService.TranscriptionReceived += OnTranscriptionReceived;
             _whisperService.StatusChanged += OnWhisperStatusChanged;
@@ -62,10 +69,6 @@ namespace H145FlightPlanner
             MinimumSize = new Size(900, 600);
             BackColor = Color.FromArgb(240, 240, 240);
             Font = new Font("Segoe UI", 10);
-
-            // -------------------------------------------------
-            // HEADER
-            // -------------------------------------------------
 
             Panel header = new Panel
             {
@@ -94,10 +97,6 @@ namespace H145FlightPlanner
 
             header.Controls.Add(title);
             header.Controls.Add(subtitle);
-
-            // -------------------------------------------------
-            // COMMAND SECTION
-            // -------------------------------------------------
 
             GroupBox commandGroup = new GroupBox
             {
@@ -164,10 +163,6 @@ namespace H145FlightPlanner
             commandGroup.Controls.Add(_microphoneButton);
             commandGroup.Controls.Add(_microphoneStatus);
 
-            // -------------------------------------------------
-            // ROUTE INFORMATION
-            // -------------------------------------------------
-
             GroupBox routeGroup = new GroupBox
             {
                 Text = "ROUTE INFORMATION",
@@ -231,10 +226,6 @@ namespace H145FlightPlanner
             routeGroup.Controls.Add(routeTypeLabel);
             routeGroup.Controls.Add(_routeTypeValue);
 
-            // -------------------------------------------------
-            // OUTPUT SECTION
-            // -------------------------------------------------
-
             GroupBox outputGroup = new GroupBox
             {
                 Text = "FLIGHT PLAN",
@@ -277,10 +268,6 @@ namespace H145FlightPlanner
 
             outputGroup.Controls.Add(_flightPlanBox);
             outputGroup.Controls.Add(_exportButton);
-
-            // -------------------------------------------------
-            // ADD CONTROLS
-            // -------------------------------------------------
 
             Controls.Add(header);
             Controls.Add(commandGroup);
@@ -354,77 +341,56 @@ namespace H145FlightPlanner
                         ? "—"
                         : request.Departure;
 
-                _destinationValue.Text =
-                    string.IsNullOrWhiteSpace(request.Destination)
-                        ? "—"
+                string displayedDestination =
+                    !string.IsNullOrWhiteSpace(request.ReturnLocation)
+                        ? request.ReturnLocation
                         : request.Destination;
+
+                _destinationValue.Text =
+                    string.IsNullOrWhiteSpace(displayedDestination)
+                        ? "—"
+                        : displayedDestination;
 
                 _routeTypeValue.Text =
                     string.IsNullOrWhiteSpace(request.RouteType)
                         ? "—"
                         : request.RouteType;
 
-                if (!string.Equals(
+                _flightPlanBox.Text =
+                    "Looking up locations and generating route...";
+
+                if (string.Equals(
                     request.RouteType,
                     "DIRECT",
                     StringComparison.OrdinalIgnoreCase))
                 {
+                    _currentFlightPlan =
+                        await _directRouteGenerator.GenerateAsync(request);
+                }
+                else if (string.Equals(
+                    request.RouteType,
+                    "ORBIT",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    _currentFlightPlan =
+                        await _orbitRouteGenerator.GenerateAsync(request);
+                }
+                else
+                {
                     _flightPlanBox.Text =
-                        "The request was understood, but this route type " +
-                        "has not been implemented yet.";
+                        "This route type has not been implemented yet.";
 
                     return;
                 }
 
-                _flightPlanBox.Text =
-                    "Looking up airports and generating route...";
-
-                _currentFlightPlan =
-                    await _directRouteGenerator.GenerateAsync(request);
-
-                var output = new StringBuilder();
-
-                output.AppendLine(
-                    $"Flight rules: {_currentFlightPlan.FlightRules}");
-
-                output.AppendLine(
-                    $"Cruising altitude: " +
-                    $"{_currentFlightPlan.CruisingAltitudeFeet} ft");
-
-                output.AppendLine();
-
-                output.AppendLine("Route:");
-
-                for (int i = 0;
-                     i < _currentFlightPlan.Waypoints.Count;
-                     i++)
-                {
-                    RouteWaypoint waypoint =
-                        _currentFlightPlan.Waypoints[i];
-
-                    output.AppendLine(
-                        $"{i + 1}. " +
-                        $"{waypoint.Ident} - " +
-                        $"{waypoint.Name}");
-
-                    output.AppendLine(
-                        $"   Lat: {waypoint.Latitude:F6}");
-
-                    output.AppendLine(
-                        $"   Lon: {waypoint.Longitude:F6}");
-
-                    output.AppendLine(
-                        $"   Alt: {waypoint.AltitudeFeet:F0} ft");
-                }
-
-                _flightPlanBox.Text = output.ToString();
+                DisplayGeneratedFlightPlan(
+                    _currentFlightPlan);
 
                 _exportButton.Enabled = true;
             }
             catch (Exception ex)
             {
                 _currentFlightPlan = null;
-
                 _exportButton.Enabled = false;
 
                 _flightPlanBox.Text =
@@ -436,6 +402,49 @@ namespace H145FlightPlanner
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
             }
+        }
+
+        private void DisplayGeneratedFlightPlan(
+            GeneratedFlightPlan flightPlan)
+        {
+            var output = new StringBuilder();
+
+            output.AppendLine(
+                $"Flight rules: {flightPlan.FlightRules}");
+
+            output.AppendLine(
+                $"Cruising altitude: " +
+                $"{flightPlan.CruisingAltitudeFeet} ft");
+
+            output.AppendLine();
+
+            output.AppendLine("Route:");
+
+            for (int i = 0;
+                 i < flightPlan.Waypoints.Count;
+                 i++)
+            {
+                RouteWaypoint waypoint =
+                    flightPlan.Waypoints[i];
+
+                output.AppendLine(
+                    $"{i + 1}. " +
+                    $"{waypoint.Ident}" +
+                    (string.IsNullOrWhiteSpace(waypoint.Name)
+                        ? string.Empty
+                        : $" - {waypoint.Name}"));
+
+                output.AppendLine(
+                    $"   Lat: {waypoint.Latitude:F6}");
+
+                output.AppendLine(
+                    $"   Lon: {waypoint.Longitude:F6}");
+
+                output.AppendLine(
+                    $"   Alt: {waypoint.AltitudeFeet:F0} ft");
+            }
+
+            _flightPlanBox.Text = output.ToString();
         }
 
         private void ExportButton_Click(
