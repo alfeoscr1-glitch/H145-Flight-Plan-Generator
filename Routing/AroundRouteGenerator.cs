@@ -167,10 +167,13 @@ namespace H145FlightPlanner.Routing
             double halfLongitude =
                 (area.EastLongitude - area.WestLongitude) / 2.0;
 
-            // Keep the route slightly outside the area's
-            // returned bounds.
-            halfLatitude *= 1.08;
-            halfLongitude *= 1.08;
+            // Keep the route just outside the area's
+            // actual returned bounds.
+            //
+            // 3% margin keeps the route tight without
+            // placing it directly on the edge.
+            halfLatitude *= 1.03;
+            halfLongitude *= 1.03;
 
             double north =
                 centreLatitude + halfLatitude;
@@ -187,10 +190,7 @@ namespace H145FlightPlanner.Routing
             // -------------------------------------------------
             // MINIMUM PRACTICAL OUTSIDE LOOP
             //
-            // Four unique corner waypoints keep the waypoint
-            // count very low while ensuring that the straight
-            // legs remain outside/around the area's bounds.
-            //
+            // Four unique corner waypoints.
             // WP5 repeats WP1 to close the loop.
             // -------------------------------------------------
 
