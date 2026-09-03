@@ -67,34 +67,56 @@ namespace H145FlightPlanner.Services
                 return null;
 
             string cleanedName =
-                placeName.Trim();
+                CleanRequestedName(placeName);
 
+            if (string.IsNullOrWhiteSpace(cleanedName))
+                return null;
+
+            List<JsonElement> results =
+                await SearchNominatimAsync(
+                    cleanedName,
+                    cancellationToken);
+
+            if (results.Count == 0)
+                return null;
+
+            JsonElement? selected =
+                SelectBestResult(
+                    results,
+                    cleanedName);
+
+            if (selected == null)
+                return null;
+
+            return CreateGeographyResult(
+                selected.Value,
+                cleanedName);
+        }
+
+        private static async Task<List<JsonElement>>
+            SearchNominatimAsync(
+                string placeName,
+                CancellationToken cancellationToken)
+        {
             string query =
-                Uri.EscapeDataString(cleanedName);
+                Uri.EscapeDataString(placeName);
 
-            // UK / Ireland operating area.
+            // The app currently operates around the UK,
+            // Ireland, Isle of Man and Channel Islands.
             //
-            // gb = United Kingdom
-            // im = Isle of Man
-            // gg = Guernsey
-            // je = Jersey
-            // ie = Ireland
-            //
-            // namedetails gives us the real name and aliases.
-            // dedupe=0 lets us compare competing OSM features.
-            // polygon_geojson gives us the actual geometry.
-
+            // This is only a geographic search filter.
+            // No individual places are hardcoded.
             string url =
                 $"https://nominatim.openstreetmap.org/search" +
                 $"?q={query}" +
                 $"&format=jsonv2" +
-                $"&limit=30" +
+                $"&limit=40" +
                 $"&addressdetails=1" +
                 $"&namedetails=1" +
                 $"&extratags=1" +
                 $"&dedupe=0" +
                 $"&polygon_geojson=1" +
-                $"&countrycodes=gb,im,gg,je,ie";
+                $"&countrycodes=gb,im,ie,gg,je";
 
             using HttpResponseMessage response =
                 await HttpClient.GetAsync(
@@ -110,17 +132,14 @@ namespace H145FlightPlanner.Services
             using JsonDocument document =
                 JsonDocument.Parse(json);
 
+            var results =
+                new List<JsonElement>();
+
             if (document.RootElement.ValueKind !=
                 JsonValueKind.Array)
             {
-                return null;
+                return results;
             }
-
-            if (document.RootElement.GetArrayLength() == 0)
-                return null;
-
-            var results =
-                new List<JsonElement>();
 
             foreach (JsonElement element
                 in document.RootElement.EnumerateArray())
@@ -129,17 +148,242 @@ namespace H145FlightPlanner.Services
                     element.Clone());
             }
 
-            JsonElement? selected =
-                SelectBestPlaceResult(
-                    results,
-                    cleanedName);
+            return results;
+        }
 
-            if (selected == null)
+        private static JsonElement? SelectBestResult(
+            List<JsonElement> results,
+            string requestedName)
+        {
+            if (results.Count == 0)
                 return null;
 
-            JsonElement result =
-                selected.Value;
+            // -------------------------------------------------
+            // EXPLICIT AVIATION REQUESTS
+            // -------------------------------------------------
 
+            if (ContainsWord(
+                requestedName,
+                "helipad"))
+            {
+                JsonElement? helipad =
+                    FindBestAviationResult(
+                        results,
+                        requestedName,
+                        "helipad");
+
+                if (helipad != null)
+                    return helipad;
+            }
+
+            if (ContainsWord(
+                requestedName,
+                "heliport"))
+            {
+                JsonElement? heliport =
+                    FindBestAviationResult(
+                        results,
+                        requestedName,
+                        "heliport");
+
+                if (heliport != null)
+                    return heliport;
+            }
+
+            if (ContainsWord(
+                    requestedName,
+                    "airport") ||
+                ContainsWord(
+                    requestedName,
+                    "aerodrome"))
+            {
+                JsonElement? airport =
+                    FindBestAirportResult(
+                        results,
+                        requestedName);
+
+                if (airport != null)
+                    return airport;
+            }
+
+            // -------------------------------------------------
+            // NORMAL GEOGRAPHIC SEARCH
+            // -------------------------------------------------
+
+            string normalizedRequest =
+                NormalizeName(
+                    requestedName);
+
+            var candidates =
+                new List<Candidate>();
+
+            foreach (JsonElement result
+                in results)
+            {
+                // If the user did not explicitly ask for
+                // aviation, never let an airport or helipad
+                // steal a normal place search.
+                if (IsAviationResult(result))
+                    continue;
+
+                int nameScore =
+                    GetNameScore(
+                        result,
+                        normalizedRequest);
+
+                int featureScore =
+                    GetFeatureScore(
+                        result,
+                        requestedName);
+
+                double importance =
+                    GetImportance(
+                        result);
+
+                bool hasGeometry =
+                    TryGetGeometryBounds(
+                        result,
+                        out double south,
+                        out double north,
+                        out double west,
+                        out double east);
+
+                double sizeNm =
+                    hasGeometry
+                        ? EstimateLargestDimensionNm(
+                            south,
+                            north,
+                            west,
+                            east)
+                        : double.MaxValue;
+
+                candidates.Add(
+                    new Candidate
+                    {
+                        Result = result,
+                        NameScore = nameScore,
+                        FeatureScore = featureScore,
+                        Importance = importance,
+                        HasGeometry = hasGeometry,
+                        SizeNm = sizeNm
+                    });
+            }
+
+            if (candidates.Count == 0)
+                return null;
+
+            // -------------------------------------------------
+            // 1. EXACT-NAME ISLAND / ISLET
+            //
+            // This prevents an island's administrative or
+            // territorial boundary winning when the actual
+            // land feature is available.
+            // -------------------------------------------------
+
+            Candidate? exactIsland =
+                candidates
+                    .Where(candidate =>
+                        candidate.NameScore >= 300 &&
+                        IsIslandResult(
+                            candidate.Result))
+                    .OrderByDescending(candidate =>
+                        candidate.HasGeometry)
+                    .ThenBy(candidate =>
+                        candidate.SizeNm)
+                    .ThenByDescending(candidate =>
+                        candidate.Importance)
+                    .FirstOrDefault();
+
+            if (exactIsland != null)
+                return exactIsland.Result;
+
+            // -------------------------------------------------
+            // 2. EXACT-NAME MATCH
+            // -------------------------------------------------
+
+            List<Candidate> exactMatches =
+                candidates
+                    .Where(candidate =>
+                        candidate.NameScore >= 300)
+                    .ToList();
+
+            if (exactMatches.Count > 0)
+            {
+                Candidate winner =
+                    exactMatches
+                        .OrderByDescending(candidate =>
+                            candidate.FeatureScore)
+                        .ThenByDescending(candidate =>
+                            candidate.HasGeometry)
+                        .ThenBy(candidate =>
+                            candidate.SizeNm)
+                        .ThenByDescending(candidate =>
+                            candidate.Importance)
+                        .First();
+
+                return winner.Result;
+            }
+
+            // -------------------------------------------------
+            // 3. STRONG ALIAS / DISPLAY-NAME MATCH
+            // -------------------------------------------------
+
+            List<Candidate> strongMatches =
+                candidates
+                    .Where(candidate =>
+                        candidate.NameScore >= 150)
+                    .ToList();
+
+            if (strongMatches.Count > 0)
+            {
+                Candidate winner =
+                    strongMatches
+                        .OrderByDescending(candidate =>
+                            candidate.NameScore)
+                        .ThenByDescending(candidate =>
+                            candidate.FeatureScore)
+                        .ThenByDescending(candidate =>
+                            candidate.HasGeometry)
+                        .ThenBy(candidate =>
+                            candidate.SizeNm)
+                        .ThenByDescending(candidate =>
+                            candidate.Importance)
+                        .First();
+
+                return winner.Result;
+            }
+
+            // -------------------------------------------------
+            // 4. FALLBACK
+            //
+            // This is important.
+            //
+            // Do NOT simply fail because our own name scoring
+            // could not recognise the way OSM named something.
+            //
+            // Nominatim already searched for the user's actual
+            // query within our operating area. Prefer its best
+            // non-aviation result rather than saying that a real
+            // place such as a county or island does not exist.
+            // -------------------------------------------------
+
+            Candidate fallback =
+                candidates
+                    .OrderByDescending(candidate =>
+                        candidate.NameScore)
+                    .ThenByDescending(candidate =>
+                        candidate.FeatureScore)
+                    .ThenByDescending(candidate =>
+                        candidate.Importance)
+                    .First();
+
+            return fallback.Result;
+        }
+
+        private static GeographyResult? CreateGeographyResult(
+            JsonElement result,
+            string requestedName)
+        {
             if (!TryGetDouble(
                 result,
                 "lat",
@@ -160,7 +404,7 @@ namespace H145FlightPlanner.Services
                 new GeographyResult
                 {
                     Name =
-                        cleanedName,
+                        requestedName,
 
                     DisplayName =
                         GetString(
@@ -194,25 +438,46 @@ namespace H145FlightPlanner.Services
                             "category")
                 };
 
-            // Prefer bounds calculated from actual geometry.
-            bool geometryBoundsFound =
-                TryReadGeometryBounds(
-                    result,
-                    geographyResult);
-
-            if (!geometryBoundsFound)
+            // First choice:
+            // actual polygon / multipolygon geometry.
+            if (TryGetGeometryBounds(
+                result,
+                out double south,
+                out double north,
+                out double west,
+                out double east))
             {
+                geographyResult.SouthLatitude =
+                    south;
+
+                geographyResult.NorthLatitude =
+                    north;
+
+                geographyResult.WestLongitude =
+                    west;
+
+                geographyResult.EastLongitude =
+                    east;
+            }
+            else
+            {
+                // Only use the normal Nominatim bounding box
+                // if detailed geometry was unavailable.
                 ReadBoundingBox(
                     result,
                     geographyResult);
             }
 
-            // Never send obviously broken/global geometry
-            // into the Around generator.
             if (geographyResult.HasBoundingBox &&
                 !BoundingBoxLooksReasonable(
                     geographyResult))
             {
+                // A bad enormous boundary must never become
+                // an Around route stretching across countries.
+                //
+                // Clearing the box causes AroundRouteGenerator
+                // to use its local fallback around the centre
+                // instead of creating a ridiculous route.
                 geographyResult.SouthLatitude = 0;
                 geographyResult.NorthLatitude = 0;
                 geographyResult.WestLongitude = 0;
@@ -222,316 +487,99 @@ namespace H145FlightPlanner.Services
             return geographyResult;
         }
 
-        private static JsonElement? SelectBestPlaceResult(
-            List<JsonElement> results,
-            string requestedName)
-        {
-            if (results.Count == 0)
-                return null;
-
-            bool wantsHelipad =
-                ContainsWord(
-                    requestedName,
-                    "helipad");
-
-            bool wantsHeliport =
-                ContainsWord(
-                    requestedName,
-                    "heliport");
-
-            bool wantsAirport =
-                ContainsWord(
-                    requestedName,
-                    "airport") ||
-                ContainsWord(
-                    requestedName,
-                    "aerodrome");
-
-            // -------------------------------------------------
-            // EXPLICIT AVIATION REQUEST
-            // -------------------------------------------------
-
-            if (wantsHelipad)
-            {
-                JsonElement? result =
-                    FindBestExplicitType(
-                        results,
-                        "helipad",
-                        requestedName);
-
-                if (result != null)
-                    return result;
-            }
-
-            if (wantsHeliport)
-            {
-                JsonElement? result =
-                    FindBestExplicitType(
-                        results,
-                        "heliport",
-                        requestedName);
-
-                if (result != null)
-                    return result;
-            }
-
-            if (wantsAirport)
-            {
-                JsonElement? airport =
-                    FindBestAirport(
-                        results,
-                        requestedName);
-
-                if (airport != null)
-                    return airport;
-            }
-
-            if (wantsHelipad ||
-                wantsHeliport ||
-                wantsAirport)
-            {
-                JsonElement? aviation =
-                    results
-                        .Where(IsAviationResult)
-                        .OrderByDescending(
-                            x => GetImportance(x))
-                        .Cast<JsonElement?>()
-                        .FirstOrDefault();
-
-                if (aviation != null)
-                    return aviation;
-
-                return results[0];
-            }
-
-            // -------------------------------------------------
-            // NORMAL PLACE / ISLAND / AREA REQUEST
-            // -------------------------------------------------
-
-            string normalizedRequest =
-                NormalizeName(
-                    requestedName);
-
-            var candidates =
-                new List<ScoredCandidate>();
-
-            foreach (JsonElement result
-                in results)
-            {
-                if (IsAviationResult(result))
-                    continue;
-
-                int nameScore =
-                    GetNameMatchScore(
-                        result,
-                        normalizedRequest);
-
-                // A weak/unrelated result should never win just
-                // because its geometry happens to be convenient.
-                if (nameScore <= 0)
-                    continue;
-
-                int featureScore =
-                    GetFeatureScore(
-                        result);
-
-                double importance =
-                    GetImportance(
-                        result);
-
-                double geometrySize =
-                    GetGeometrySizeScore(
-                        result);
-
-                double totalScore =
-                    nameScore +
-                    featureScore +
-                    (importance * 100.0);
-
-                // Among otherwise good matches, prefer the
-                // tighter actual geographic feature.
-                //
-                // This is what helps an island feature beat
-                // an oversized territorial/admin boundary.
-                if (geometrySize > 0)
-                {
-                    totalScore -=
-                        Math.Min(
-                            geometrySize,
-                            100.0);
-                }
-
-                candidates.Add(
-                    new ScoredCandidate
-                    {
-                        Result =
-                            result,
-
-                        Score =
-                            totalScore,
-
-                        NameScore =
-                            nameScore,
-
-                        FeatureScore =
-                            featureScore,
-
-                        Importance =
-                            importance,
-
-                        GeometrySize =
-                            geometrySize
-                    });
-            }
-
-            if (candidates.Count == 0)
-                return null;
-
-            // -------------------------------------------------
-            // FIRST CHOICE:
-            // Exact-name island/islet.
-            //
-            // If OSM has an actual island object for the name,
-            // use it instead of an administrative boundary.
-            // -------------------------------------------------
-
-            ScoredCandidate? exactIsland =
-                candidates
-                    .Where(candidate =>
-                        candidate.NameScore >= 200 &&
-                        IsIslandResult(
-                            candidate.Result))
-                    .OrderBy(candidate =>
-                        candidate.GeometrySize <= 0
-                            ? double.MaxValue
-                            : candidate.GeometrySize)
-                    .ThenByDescending(candidate =>
-                        candidate.Importance)
-                    .FirstOrDefault();
-
-            if (exactIsland != null)
-            {
-                return exactIsland.Result;
-            }
-
-            // -------------------------------------------------
-            // SECOND CHOICE:
-            // Exact-name geographic features.
-            //
-            // Prefer actual place/region geometry with a tight
-            // footprint over an enormous administrative area.
-            // -------------------------------------------------
-
-            List<ScoredCandidate> exactMatches =
-                candidates
-                    .Where(candidate =>
-                        candidate.NameScore >= 200)
-                    .ToList();
-
-            if (exactMatches.Count > 0)
-            {
-                ScoredCandidate bestExact =
-                    exactMatches
-                        .OrderByDescending(candidate =>
-                            candidate.FeatureScore)
-                        .ThenByDescending(candidate =>
-                            candidate.Importance)
-                        .ThenBy(candidate =>
-                            candidate.GeometrySize <= 0
-                                ? double.MaxValue
-                                : candidate.GeometrySize)
-                        .First();
-
-                return bestExact.Result;
-            }
-
-            // -------------------------------------------------
-            // THIRD CHOICE:
-            // Strong alias/name match.
-            // -------------------------------------------------
-
-            ScoredCandidate best =
-                candidates
-                    .OrderByDescending(candidate =>
-                        candidate.Score)
-                    .First();
-
-            // Don't silently accept something with an extremely
-            // weak relationship to what the user actually said.
-            if (best.NameScore < 80)
-                return null;
-
-            return best.Result;
-        }
-
-        private static int GetNameMatchScore(
+        private static int GetNameScore(
             JsonElement result,
             string normalizedRequest)
         {
-            if (string.IsNullOrWhiteSpace(
-                normalizedRequest))
-            {
-                return 0;
-            }
-
             int bestScore =
                 0;
 
-            foreach (string name
-                in GetResultNames(result))
+            foreach (string candidateName
+                in GetAllNames(result))
             {
-                string normalizedName =
-                    NormalizeName(name);
+                string normalizedCandidate =
+                    NormalizeName(
+                        candidateName);
 
                 if (string.IsNullOrWhiteSpace(
-                    normalizedName))
+                    normalizedCandidate))
                 {
                     continue;
                 }
 
+                // Exact match.
                 if (string.Equals(
-                    normalizedName,
+                    normalizedCandidate,
                     normalizedRequest,
                     StringComparison.OrdinalIgnoreCase))
                 {
                     bestScore =
                         Math.Max(
                             bestScore,
-                            250);
+                            400);
 
                     continue;
                 }
 
-                if (normalizedName.StartsWith(
+                // Ignore leading descriptors for matching.
+                //
+                // Example:
+                // "Isle of Anglesey"
+                // can still strongly match "Anglesey".
+                string simplifiedCandidate =
+                    RemoveGeographicDescriptors(
+                        normalizedCandidate);
+
+                string simplifiedRequest =
+                    RemoveGeographicDescriptors(
+                        normalizedRequest);
+
+                if (string.Equals(
+                    simplifiedCandidate,
+                    simplifiedRequest,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    bestScore =
+                        Math.Max(
+                            bestScore,
+                            320);
+
+                    continue;
+                }
+
+                if (normalizedCandidate.StartsWith(
                         normalizedRequest + " ",
                         StringComparison.OrdinalIgnoreCase) ||
-                    normalizedName.EndsWith(
+                    normalizedCandidate.EndsWith(
                         " " + normalizedRequest,
                         StringComparison.OrdinalIgnoreCase))
                 {
                     bestScore =
                         Math.Max(
                             bestScore,
-                            170);
+                            220);
 
                     continue;
                 }
 
-                if (normalizedName.Contains(
-                    normalizedRequest,
-                    StringComparison.OrdinalIgnoreCase))
+                if (normalizedCandidate.Contains(
+                        normalizedRequest,
+                        StringComparison.OrdinalIgnoreCase) ||
+                    normalizedRequest.Contains(
+                        normalizedCandidate,
+                        StringComparison.OrdinalIgnoreCase))
                 {
                     bestScore =
                         Math.Max(
                             bestScore,
-                            100);
+                            160);
                 }
             }
 
             return bestScore;
         }
 
-        private static IEnumerable<string> GetResultNames(
+        private static IEnumerable<string> GetAllNames(
             JsonElement result)
         {
             var names =
@@ -575,8 +623,8 @@ namespace H145FlightPlanner.Services
             }
 
             if (result.TryGetProperty(
-                "namedetails",
-                out JsonElement nameDetails) &&
+                    "namedetails",
+                    out JsonElement nameDetails) &&
                 nameDetails.ValueKind ==
                     JsonValueKind.Object)
             {
@@ -605,7 +653,8 @@ namespace H145FlightPlanner.Services
         }
 
         private static int GetFeatureScore(
-            JsonElement result)
+            JsonElement result,
+            string requestedName)
         {
             string category =
                 GetString(
@@ -617,27 +666,35 @@ namespace H145FlightPlanner.Services
                     result,
                     "type");
 
+            int score =
+                0;
+
             if (string.Equals(
-                    type,
-                    "island",
-                    StringComparison.OrdinalIgnoreCase))
+                type,
+                "island",
+                StringComparison.OrdinalIgnoreCase))
             {
-                return 180;
+                score +=
+                    300;
             }
 
             if (string.Equals(
-                    type,
-                    "islet",
-                    StringComparison.OrdinalIgnoreCase))
+                type,
+                "islet",
+                StringComparison.OrdinalIgnoreCase))
             {
-                return 160;
+                score +=
+                    280;
             }
 
             if (string.Equals(
-                    category,
-                    "place",
-                    StringComparison.OrdinalIgnoreCase))
+                category,
+                "place",
+                StringComparison.OrdinalIgnoreCase))
             {
+                score +=
+                    160;
+
                 if (string.Equals(
                         type,
                         "city",
@@ -651,49 +708,47 @@ namespace H145FlightPlanner.Services
                         "village",
                         StringComparison.OrdinalIgnoreCase))
                 {
-                    return 150;
+                    score +=
+                        100;
                 }
-
-                if (string.Equals(
-                        type,
-                        "municipality",
-                        StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(
-                        type,
-                        "borough",
-                        StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(
-                        type,
-                        "suburb",
-                        StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(
-                        type,
-                        "locality",
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    return 110;
-                }
-
-                return 100;
             }
 
             if (string.Equals(
-                    category,
-                    "boundary",
-                    StringComparison.OrdinalIgnoreCase))
+                category,
+                "natural",
+                StringComparison.OrdinalIgnoreCase))
             {
-                return 80;
+                score +=
+                    180;
             }
 
             if (string.Equals(
-                    category,
-                    "natural",
-                    StringComparison.OrdinalIgnoreCase))
+                category,
+                "boundary",
+                StringComparison.OrdinalIgnoreCase))
             {
-                return 120;
+                score +=
+                    120;
             }
 
-            return 40;
+            // If the user's wording itself clearly describes
+            // an island, give island results an extra advantage.
+            //
+            // This is generic language understanding,
+            // not a hardcoded place.
+            if ((ContainsWord(
+                    requestedName,
+                    "island") ||
+                 ContainsWord(
+                    requestedName,
+                    "isle")) &&
+                IsIslandResult(result))
+            {
+                score +=
+                    200;
+            }
+
+            return score;
         }
 
         private static bool IsIslandResult(
@@ -755,89 +810,27 @@ namespace H145FlightPlanner.Services
                     StringComparison.OrdinalIgnoreCase);
         }
 
-        private static double GetImportance(
-            JsonElement result)
-        {
-            if (!result.TryGetProperty(
-                "importance",
-                out JsonElement importanceElement))
-            {
-                return 0;
-            }
-
-            if (importanceElement.ValueKind ==
-                    JsonValueKind.Number &&
-                importanceElement.TryGetDouble(
-                    out double importance))
-            {
-                return importance;
-            }
-
-            return 0;
-        }
-
-        private static double GetGeometrySizeScore(
-            JsonElement result)
-        {
-            if (!TryGetGeometryBounds(
-                result,
-                out double south,
-                out double north,
-                out double west,
-                out double east))
-            {
-                return 0;
-            }
-
-            double latitudeSpan =
-                Math.Abs(
-                    north -
-                    south);
-
-            double centreLatitude =
-                (north + south) / 2.0;
-
-            double longitudeSpan =
-                Math.Abs(
-                    east -
-                    west) *
-                Math.Cos(
-                    centreLatitude *
-                    Math.PI /
-                    180.0);
-
-            // Approximate degrees converted to NM.
-            double northSouthNm =
-                latitudeSpan * 60.0;
-
-            double eastWestNm =
-                longitudeSpan * 60.0;
-
-            return Math.Max(
-                northSouthNm,
-                eastWestNm);
-        }
-
-        private static JsonElement? FindBestExplicitType(
-            List<JsonElement> results,
-            string type,
-            string requestedName)
+        private static JsonElement?
+            FindBestAviationResult(
+                List<JsonElement> results,
+                string requestedName,
+                string requiredType)
         {
             string normalizedRequest =
                 NormalizeName(
                     requestedName);
 
-            var matches =
+            List<JsonElement> matches =
                 results
                     .Where(result =>
                         string.Equals(
                             GetString(
                                 result,
                                 "type"),
-                            type,
+                            requiredType,
                             StringComparison.OrdinalIgnoreCase))
                     .OrderByDescending(result =>
-                        GetNameMatchScore(
+                        GetNameScore(
                             result,
                             normalizedRequest))
                     .ThenByDescending(result =>
@@ -851,15 +844,16 @@ namespace H145FlightPlanner.Services
             return matches[0];
         }
 
-        private static JsonElement? FindBestAirport(
-            List<JsonElement> results,
-            string requestedName)
+        private static JsonElement?
+            FindBestAirportResult(
+                List<JsonElement> results,
+                string requestedName)
         {
             string normalizedRequest =
                 NormalizeName(
                     requestedName);
 
-            var matches =
+            List<JsonElement> matches =
                 results
                     .Where(result =>
                     {
@@ -871,15 +865,15 @@ namespace H145FlightPlanner.Services
                         return
                             string.Equals(
                                 type,
-                                "aerodrome",
+                                "airport",
                                 StringComparison.OrdinalIgnoreCase) ||
                             string.Equals(
                                 type,
-                                "airport",
+                                "aerodrome",
                                 StringComparison.OrdinalIgnoreCase);
                     })
                     .OrderByDescending(result =>
-                        GetNameMatchScore(
+                        GetNameScore(
                             result,
                             normalizedRequest))
                     .ThenByDescending(result =>
@@ -893,76 +887,30 @@ namespace H145FlightPlanner.Services
             return matches[0];
         }
 
-        private static bool ContainsWord(
-            string text,
-            string word)
+        private static double GetImportance(
+            JsonElement result)
         {
-            return Regex.IsMatch(
-                text,
-                $@"\b{Regex.Escape(word)}\b",
-                RegexOptions.IgnoreCase);
-        }
-
-        private static string NormalizeName(
-            string value)
-        {
-            if (string.IsNullOrWhiteSpace(
-                value))
+            if (!result.TryGetProperty(
+                "importance",
+                out JsonElement importance))
             {
-                return string.Empty;
+                return 0;
             }
 
-            string normalized =
-                value.Trim();
+            if (importance.ValueKind ==
+                    JsonValueKind.Number &&
+                importance.TryGetDouble(
+                    out double value))
+            {
+                return value;
+            }
 
-            normalized =
-                Regex.Replace(
-                    normalized,
-                    @"^(?:the\s+)",
-                    string.Empty,
-                    RegexOptions.IgnoreCase);
-
-            normalized =
-                Regex.Replace(
-                    normalized,
-                    @"\s+",
-                    " ");
-
-            return normalized.Trim();
+            return 0;
         }
 
         // -----------------------------------------------------
-        // GEOMETRY
+        // REAL OSM GEOMETRY
         // -----------------------------------------------------
-
-        private static bool TryReadGeometryBounds(
-            JsonElement result,
-            GeographyResult geographyResult)
-        {
-            if (!TryGetGeometryBounds(
-                result,
-                out double south,
-                out double north,
-                out double west,
-                out double east))
-            {
-                return false;
-            }
-
-            geographyResult.SouthLatitude =
-                south;
-
-            geographyResult.NorthLatitude =
-                north;
-
-            geographyResult.WestLongitude =
-                west;
-
-            geographyResult.EastLongitude =
-                east;
-
-            return true;
-        }
 
         private static bool TryGetGeometryBounds(
             JsonElement result,
@@ -971,17 +919,10 @@ namespace H145FlightPlanner.Services
             out double west,
             out double east)
         {
-            south =
-                0;
-
-            north =
-                0;
-
-            west =
-                0;
-
-            east =
-                0;
+            south = 0;
+            north = 0;
+            west = 0;
+            east = 0;
 
             if (!result.TryGetProperty(
                 "geojson",
@@ -1058,9 +999,8 @@ namespace H145FlightPlanner.Services
                 return;
             }
 
-            // GeoJSON coordinate:
-            // [longitude, latitude]
-
+            // GeoJSON coordinate pair:
+            // longitude, latitude
             if (element.GetArrayLength() >= 2 &&
                 element[0].ValueKind ==
                     JsonValueKind.Number &&
@@ -1116,6 +1056,35 @@ namespace H145FlightPlanner.Services
                     ref maxLongitude,
                     ref foundCoordinate);
             }
+        }
+
+        private static double EstimateLargestDimensionNm(
+            double south,
+            double north,
+            double west,
+            double east)
+        {
+            double northSouthNm =
+                Math.Abs(
+                    north - south) *
+                60.0;
+
+            double centreLatitude =
+                (north + south) /
+                2.0;
+
+            double eastWestNm =
+                Math.Abs(
+                    east - west) *
+                60.0 *
+                Math.Cos(
+                    centreLatitude *
+                    Math.PI /
+                    180.0);
+
+            return Math.Max(
+                northSouthNm,
+                eastWestNm);
         }
 
         // -----------------------------------------------------
@@ -1182,17 +1151,17 @@ namespace H145FlightPlanner.Services
         }
 
         private static bool BoundingBoxLooksReasonable(
-            GeographyResult geographyResult)
+            GeographyResult result)
         {
             double latitudeSpan =
                 Math.Abs(
-                    geographyResult.NorthLatitude -
-                    geographyResult.SouthLatitude);
+                    result.NorthLatitude -
+                    result.SouthLatitude);
 
             double longitudeSpan =
                 Math.Abs(
-                    geographyResult.EastLongitude -
-                    geographyResult.WestLongitude);
+                    result.EastLongitude -
+                    result.WestLongitude);
 
             if (latitudeSpan <= 0 ||
                 longitudeSpan <= 0)
@@ -1200,13 +1169,105 @@ namespace H145FlightPlanner.Services
                 return false;
             }
 
-            if (latitudeSpan > 8.0)
+            // These are only guards against completely
+            // nonsensical/global geometry.
+            //
+            // They are deliberately large enough for
+            // genuine countries and regions.
+            if (latitudeSpan > 15.0)
                 return false;
 
-            if (longitudeSpan > 12.0)
+            if (longitudeSpan > 20.0)
                 return false;
 
             return true;
+        }
+
+        private static string CleanRequestedName(
+            string value)
+        {
+            string cleaned =
+                value.Trim();
+
+            cleaned =
+                Regex.Replace(
+                    cleaned,
+                    @"^[,.;:\s]+",
+                    string.Empty);
+
+            cleaned =
+                Regex.Replace(
+                    cleaned,
+                    @"[,.;:\s]+$",
+                    string.Empty);
+
+            return cleaned.Trim();
+        }
+
+        private static string NormalizeName(
+            string value)
+        {
+            if (string.IsNullOrWhiteSpace(
+                value))
+            {
+                return string.Empty;
+            }
+
+            string normalized =
+                value.Trim()
+                    .ToLowerInvariant();
+
+            normalized =
+                Regex.Replace(
+                    normalized,
+                    @"^(?:the\s+)",
+                    string.Empty);
+
+            normalized =
+                Regex.Replace(
+                    normalized,
+                    @"[^\p{L}\p{N}\s]",
+                    " ");
+
+            normalized =
+                Regex.Replace(
+                    normalized,
+                    @"\s+",
+                    " ");
+
+            return normalized.Trim();
+        }
+
+        private static string RemoveGeographicDescriptors(
+            string value)
+        {
+            string result =
+                value;
+
+            result =
+                Regex.Replace(
+                    result,
+                    @"\b(?:isle\s+of|island\s+of|county\s+of)\b",
+                    string.Empty,
+                    RegexOptions.IgnoreCase);
+
+            result =
+                Regex.Replace(
+                    result,
+                    @"\s+",
+                    " ");
+
+            return result.Trim();
+        }
+
+        private static bool ContainsWord(
+            string text,
+            string word)
+        {
+            return Regex.IsMatch(
+                text,
+                $@"\b{Regex.Escape(word)}\b",
+                RegexOptions.IgnoreCase);
         }
 
         private static bool TryGetDouble(
@@ -1214,8 +1275,7 @@ namespace H145FlightPlanner.Services
             string propertyName,
             out double value)
         {
-            value =
-                0;
+            value = 0;
 
             if (!element.TryGetProperty(
                 propertyName,
@@ -1232,9 +1292,15 @@ namespace H145FlightPlanner.Services
                 return true;
             }
 
-            return TryParseDouble(
-                property.GetString(),
-                out value);
+            if (property.ValueKind ==
+                JsonValueKind.String)
+            {
+                return TryParseDouble(
+                    property.GetString(),
+                    out value);
+            }
+
+            return false;
         }
 
         private static bool TryParseDouble(
@@ -1283,19 +1349,17 @@ namespace H145FlightPlanner.Services
             if (property.ValueKind ==
                     JsonValueKind.Number &&
                 property.TryGetInt64(
-                    out long number))
+                    out long value))
             {
-                return number;
+                return value;
             }
 
             return 0;
         }
 
-        private sealed class ScoredCandidate
+        private sealed class Candidate
         {
             public JsonElement Result { get; set; }
-
-            public double Score { get; set; }
 
             public int NameScore { get; set; }
 
@@ -1303,7 +1367,9 @@ namespace H145FlightPlanner.Services
 
             public double Importance { get; set; }
 
-            public double GeometrySize { get; set; }
+            public bool HasGeometry { get; set; }
+
+            public double SizeNm { get; set; }
         }
     }
 }
