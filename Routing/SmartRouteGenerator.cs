@@ -1,6 +1,4 @@
 using System;
-using System.Collections.Generic;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using H145FlightPlanner.Models;
@@ -8,11 +6,15 @@ using H145FlightPlanner.Services;
 
 namespace H145FlightPlanner.Routing
 {
+    // Executes the ordered plan returned by the invisible local AI. It supports
+    // an arbitrary number of route legs; there is no hardcoded 2- or 3-place
+    // limit.
     public class SmartRouteGenerator
     {
         private readonly AirportService _airportService;
         private readonly GeographyService _geographyService;
         private readonly CoastlineGeometryService _coastlineGeometryService;
+        private readonly SmartGeographyService _smartGeographyService;
 
         public SmartRouteGenerator(
             AirportService airportService,
@@ -22,6 +24,7 @@ namespace H145FlightPlanner.Routing
             _airportService = airportService;
             _geographyService = geographyService;
             _coastlineGeometryService = coastlineGeometryService;
+            _smartGeographyService = new SmartGeographyService(airportService);
         }
 
         public async Task<GeneratedFlightPlan> GenerateAsync(
@@ -44,41 +47,75 @@ namespace H145FlightPlanner.Routing
                 CruisingAltitudeFeet = altitude
             };
 
-            ResolvedLocation current =
-                await ResolveAsync(plan.Start, cancellationToken);
+            SmartMapLocation current =
+                await _smartGeographyService.ResolveAsync(plan.Start, null, cancellationToken);
 
-            AddResolvedWaypoint(flightPlan, current, altitude, "START");
+            AddLocationWaypoint(flightPlan, current, altitude, "START");
 
             int coastlineNumber = 1;
             int userNumber = 1;
 
             foreach (SmartRouteStep step in plan.Steps)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 string action = (step.Action ?? string.Empty).Trim().ToUpperInvariant();
 
                 if (action == "DIRECT")
                 {
                     string targetText = FirstNonEmpty(step.To, step.Location);
-                    if (string.IsNullOrWhiteSpace(targetText))
+                    if (targetText.Length == 0)
                         continue;
 
-                    ResolvedLocation target = await ResolveAsync(targetText, cancellationToken);
-                    AddResolvedWaypoint(flightPlan, target, altitude, $"USR{userNumber++:000}");
+                    SmartMapLocation target =
+                        await _smartGeographyService.ResolveAsync(targetText, current, cancellationToken);
+                    AddLocationWaypoint(flightPlan, target, altitude, $"USR{userNumber++:000}");
                     current = target;
+                    continue;
+                }
+
+                if (action == "COASTLINE_ALONG")
+                {
+                    SmartMapLocation from = current;
+
+                    if (!string.IsNullOrWhiteSpace(step.From))
+                    {
+                        SmartMapLocation explicitFrom =
+                            await _smartGeographyService.ResolveAsync(step.From, current, cancellationToken);
+
+                        if (!SameLocation(current, explicitFrom))
+                            AddLocationWaypoint(flightPlan, explicitFrom, altitude, $"USR{userNumber++:000}");
+
+                        from = explicitFrom;
+                    }
+
+                    string toText = FirstNonEmpty(step.To, step.Location);
+                    if (toText.Length == 0)
+                        throw new InvalidOperationException("A coastline-following step did not contain a destination.");
+
+                    SmartMapLocation to =
+                        await _smartGeographyService.ResolveAsync(toText, from, cancellationToken);
+
+                    CoastlineGeometry geometry =
+                        await _coastlineGeometryService.GetAlongCoastlineAsync(
+                            from.Latitude, from.Longitude,
+                            to.Latitude, to.Longitude,
+                            cancellationToken);
+
+                    AddGeometry(flightPlan, geometry, altitude, ref coastlineNumber);
+                    AddLocationWaypoint(flightPlan, to, altitude, $"USR{userNumber++:000}");
+                    current = to;
                     continue;
                 }
 
                 if (action == "COASTLINE_AROUND")
                 {
-                    string areaName = FirstNonEmpty(step.Location, step.To);
-                    if (string.IsNullOrWhiteSpace(areaName))
-                        continue;
+                    string areaText = FirstNonEmpty(step.Location, step.To);
+                    if (areaText.Length == 0)
+                        throw new InvalidOperationException("A coastline-around step did not contain a landmass/place.");
 
-                    GeographyResult? area =
-                        await _geographyService.FindPlaceAsync(areaName, cancellationToken);
-
-                    if (area == null)
-                        throw new InvalidOperationException($"{areaName} could not be found on the map.");
+                    SmartMapLocation areaLocation =
+                        await _smartGeographyService.ResolveAsync(areaText, current, cancellationToken);
+                    GeographyResult area = _smartGeographyService.ToGeographyResult(areaLocation);
 
                     CoastlineGeometry geometry =
                         await _coastlineGeometryService.GetAroundCoastlineAsync(area, cancellationToken);
@@ -88,57 +125,26 @@ namespace H145FlightPlanner.Routing
                     if (geometry.Points.Count > 0)
                     {
                         CoastlinePoint last = geometry.Points[^1];
-                        current = ResolvedLocation.User(areaName, last.Latitude, last.Longitude);
-                    }
-
-                    continue;
-                }
-
-                if (action == "COASTLINE_ALONG")
-                {
-                    ResolvedLocation from = current;
-
-                    if (!string.IsNullOrWhiteSpace(step.From))
-                    {
-                        from = await ResolveAsync(step.From, cancellationToken);
-
-                        if (!SameLocation(current, from))
+                        current = new SmartMapLocation
                         {
-                            AddResolvedWaypoint(
-                                flightPlan,
-                                from,
-                                altitude,
-                                $"USR{userNumber++:000}");
-                        }
+                            Query = areaText,
+                            Name = areaLocation.Name,
+                            DisplayName = areaLocation.DisplayName,
+                            Latitude = last.Latitude,
+                            Longitude = last.Longitude
+                        };
                     }
-
-                    string toText = FirstNonEmpty(step.To, step.Location);
-                    if (string.IsNullOrWhiteSpace(toText))
-                        throw new InvalidOperationException("A coastline-following step had no destination.");
-
-                    ResolvedLocation to = await ResolveAsync(toText, cancellationToken);
-
-                    CoastlineGeometry geometry =
-                        await _coastlineGeometryService.GetAlongCoastlineAsync(
-                            from.Latitude,
-                            from.Longitude,
-                            to.Latitude,
-                            to.Longitude,
-                            cancellationToken);
-
-                    AddGeometry(flightPlan, geometry, altitude, ref coastlineNumber);
-                    AddResolvedWaypoint(flightPlan, to, altitude, $"USR{userNumber++:000}");
-                    current = to;
                     continue;
                 }
 
                 if (action == "ORBIT")
                 {
                     string targetText = FirstNonEmpty(step.Location, step.To);
-                    if (string.IsNullOrWhiteSpace(targetText))
+                    if (targetText.Length == 0)
                         continue;
 
-                    ResolvedLocation target = await ResolveAsync(targetText, cancellationToken);
+                    SmartMapLocation target =
+                        await _smartGeographyService.ResolveAsync(targetText, current, cancellationToken);
                     AddSimpleOrbit(flightPlan, target, altitude, ref userNumber);
                     current = target;
                     continue;
@@ -147,55 +153,28 @@ namespace H145FlightPlanner.Routing
                 if (action == "RETURN" || action == "END")
                 {
                     string targetText = FirstNonEmpty(step.To, step.Location, plan.End);
-                    if (string.IsNullOrWhiteSpace(targetText))
+                    if (targetText.Length == 0)
                         continue;
 
-                    ResolvedLocation target = await ResolveAsync(targetText, cancellationToken);
-                    AddResolvedWaypoint(flightPlan, target, altitude, $"USR{userNumber++:000}");
+                    SmartMapLocation target =
+                        await _smartGeographyService.ResolveAsync(targetText, current, cancellationToken);
+                    AddLocationWaypoint(flightPlan, target, altitude, $"USR{userNumber++:000}");
                     current = target;
                 }
             }
 
             if (!string.IsNullOrWhiteSpace(plan.End))
             {
-                ResolvedLocation final = await ResolveAsync(plan.End, cancellationToken);
+                SmartMapLocation final =
+                    await _smartGeographyService.ResolveAsync(plan.End, current, cancellationToken);
                 if (!SameLocation(current, final))
-                    AddResolvedWaypoint(flightPlan, final, altitude, $"USR{userNumber++:000}");
+                    AddLocationWaypoint(flightPlan, final, altitude, $"USR{userNumber++:000}");
             }
 
             if (flightPlan.Waypoints.Count < 2)
                 throw new InvalidOperationException("The interpreted route did not produce enough waypoints.");
 
             return flightPlan;
-        }
-
-        private async Task<ResolvedLocation> ResolveAsync(
-            string value,
-            CancellationToken cancellationToken)
-        {
-            string text = (value ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(text))
-                throw new InvalidOperationException("A route location was empty.");
-
-            if (Regex.IsMatch(text, @"^[A-Za-z]{4}$"))
-            {
-                AirportResult? airport =
-                    await _airportService.FindByIcaoAsync(text.ToUpperInvariant(), cancellationToken);
-
-                if (airport != null)
-                    return ResolvedLocation.FromAirport(airport);
-            }
-
-            GeographyResult? place =
-                await _geographyService.FindPlaceAsync(text, cancellationToken);
-
-            if (place == null)
-                throw new InvalidOperationException($"{text} could not be found.");
-
-            return ResolvedLocation.User(
-                place.DisplayName.Length > 0 ? place.DisplayName : text,
-                place.Latitude,
-                place.Longitude);
         }
 
         private static void AddGeometry(
@@ -209,14 +188,14 @@ namespace H145FlightPlanner.Routing
                 if (flightPlan.Waypoints.Count > 0)
                 {
                     RouteWaypoint previous = flightPlan.Waypoints[^1];
-                    if (DistanceNm(previous.Latitude, previous.Longitude, point.Latitude, point.Longitude) < 0.005)
+                    if (DistanceNm(previous.Latitude, previous.Longitude, point.Latitude, point.Longitude) < 0.003)
                         continue;
                 }
 
                 flightPlan.Waypoints.Add(new RouteWaypoint
                 {
-                    Name = "Detailed outer edge",
-                    Ident = $"CST{coastlineNumber++:000}",
+                    Name = "Detailed coast edge",
+                    Ident = $"CST{coastlineNumber++:0000}",
                     Type = "USER",
                     Latitude = point.Latitude,
                     Longitude = point.Longitude,
@@ -225,9 +204,9 @@ namespace H145FlightPlanner.Routing
             }
         }
 
-        private static void AddResolvedWaypoint(
+        private static void AddLocationWaypoint(
             GeneratedFlightPlan flightPlan,
-            ResolvedLocation location,
+            SmartMapLocation location,
             int altitude,
             string fallbackIdent)
         {
@@ -240,8 +219,8 @@ namespace H145FlightPlanner.Routing
 
             flightPlan.Waypoints.Add(new RouteWaypoint
             {
-                Name = location.Name,
-                Ident = string.IsNullOrWhiteSpace(location.Ident) ? fallbackIdent : location.Ident,
+                Name = location.DisplayName.Length > 0 ? location.DisplayName : location.Name,
+                Ident = location.Ident.Length > 0 ? location.Ident : fallbackIdent,
                 Type = location.IsAirport ? "AIRPORT" : "USER",
                 Latitude = location.Latitude,
                 Longitude = location.Longitude,
@@ -251,18 +230,18 @@ namespace H145FlightPlanner.Routing
 
         private static void AddSimpleOrbit(
             GeneratedFlightPlan flightPlan,
-            ResolvedLocation centre,
+            SmartMapLocation centre,
             int altitude,
             ref int userNumber)
         {
             const double radiusNm = 1.0;
-            const int points = 24;
+            const int pointCount = 36;
 
-            for (int i = 0; i <= points; i++)
+            for (int i = 0; i <= pointCount; i++)
             {
-                double angle = i * 360.0 / points;
-                (double lat, double lon) = DestinationPoint(
-                    centre.Latitude, centre.Longitude, angle, radiusNm);
+                double bearing = i * 360.0 / pointCount;
+                (double lat, double lon) = Destination(
+                    centre.Latitude, centre.Longitude, bearing, radiusNm);
 
                 flightPlan.Waypoints.Add(new RouteWaypoint
                 {
@@ -276,82 +255,42 @@ namespace H145FlightPlanner.Routing
             }
         }
 
-        private static bool SameLocation(ResolvedLocation a, ResolvedLocation b) =>
+        private static bool SameLocation(SmartMapLocation a, SmartMapLocation b) =>
             DistanceNm(a.Latitude, a.Longitude, b.Latitude, b.Longitude) < 0.05;
 
-        private static string FirstNonEmpty(params string[] values)
+        private static string FirstNonEmpty(params string?[] values)
         {
-            foreach (string value in values)
+            foreach (string? value in values)
                 if (!string.IsNullOrWhiteSpace(value))
                     return value.Trim();
             return string.Empty;
         }
 
-        private static double DistanceNm(
-            double lat1, double lon1, double lat2, double lon2)
-        {
-            const double r = 3440.065;
-            double p1 = lat1 * Math.PI / 180.0;
-            double p2 = lat2 * Math.PI / 180.0;
-            double dp = (lat2 - lat1) * Math.PI / 180.0;
-            double dl = (lon2 - lon1) * Math.PI / 180.0;
-            double a = Math.Sin(dp / 2) * Math.Sin(dp / 2) +
-                       Math.Cos(p1) * Math.Cos(p2) *
-                       Math.Sin(dl / 2) * Math.Sin(dl / 2);
-            return r * 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
-        }
-
-        private static (double Latitude, double Longitude) DestinationPoint(
+        private static (double Lat, double Lon) Destination(
             double latitude,
             double longitude,
             double bearingDegrees,
             double distanceNm)
         {
-            const double r = 3440.065;
-            double d = distanceNm / r;
-            double b = bearingDegrees * Math.PI / 180.0;
-            double p1 = latitude * Math.PI / 180.0;
-            double l1 = longitude * Math.PI / 180.0;
-
-            double p2 = Math.Asin(
-                Math.Sin(p1) * Math.Cos(d) +
-                Math.Cos(p1) * Math.Sin(d) * Math.Cos(b));
-
-            double l2 = l1 + Math.Atan2(
-                Math.Sin(b) * Math.Sin(d) * Math.Cos(p1),
-                Math.Cos(d) - Math.Sin(p1) * Math.Sin(p2));
-
-            return (p2 * 180.0 / Math.PI, l2 * 180.0 / Math.PI);
+            const double radius = 3440.065;
+            double angular = distanceNm / radius;
+            double bearing = bearingDegrees * Math.PI / 180.0;
+            double lat1 = latitude * Math.PI / 180.0;
+            double lon1 = longitude * Math.PI / 180.0;
+            double lat2 = Math.Asin(Math.Sin(lat1) * Math.Cos(angular) + Math.Cos(lat1) * Math.Sin(angular) * Math.Cos(bearing));
+            double lon2 = lon1 + Math.Atan2(Math.Sin(bearing) * Math.Sin(angular) * Math.Cos(lat1), Math.Cos(angular) - Math.Sin(lat1) * Math.Sin(lat2));
+            return (lat2 * 180.0 / Math.PI, lon2 * 180.0 / Math.PI);
         }
 
-        private sealed class ResolvedLocation
+        private static double DistanceNm(double lat1, double lon1, double lat2, double lon2)
         {
-            public string Name { get; set; } = string.Empty;
-            public string Ident { get; set; } = string.Empty;
-            public double Latitude { get; set; }
-            public double Longitude { get; set; }
-            public double ElevationFeet { get; set; }
-            public bool IsAirport { get; set; }
-
-            public static ResolvedLocation FromAirport(AirportResult airport) =>
-                new ResolvedLocation
-                {
-                    Name = airport.Name,
-                    Ident = airport.Ident,
-                    Latitude = airport.Latitude,
-                    Longitude = airport.Longitude,
-                    ElevationFeet = airport.ElevationFeet,
-                    IsAirport = true
-                };
-
-            public static ResolvedLocation User(string name, double latitude, double longitude) =>
-                new ResolvedLocation
-                {
-                    Name = name,
-                    Latitude = latitude,
-                    Longitude = longitude,
-                    IsAirport = false
-                };
+            const double radius = 3440.065;
+            double p1 = lat1 * Math.PI / 180.0;
+            double p2 = lat2 * Math.PI / 180.0;
+            double dp = (lat2 - lat1) * Math.PI / 180.0;
+            double dl = (lon2 - lon1) * Math.PI / 180.0;
+            double a = Math.Sin(dp / 2) * Math.Sin(dp / 2) + Math.Cos(p1) * Math.Cos(p2) * Math.Sin(dl / 2) * Math.Sin(dl / 2);
+            return radius * 2.0 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1.0 - a));
         }
     }
 }
