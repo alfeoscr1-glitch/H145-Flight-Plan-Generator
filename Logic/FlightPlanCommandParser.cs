@@ -28,14 +28,32 @@ namespace H145FlightPlanner.Logic
             if (icaoCodes.Count > 1)
                 request.Destination = icaoCodes[1];
 
-            // If the first and last ICAO are the same,
-            // this can later represent a return-to-origin route.
             if (icaoCodes.Count > 2)
                 request.ReturnLocation = icaoCodes[^1];
 
             request.RouteType = DetectRouteType(text);
 
-            request.OrbitLocation = ExtractOrbitLocation(text);
+            request.OrbitLocation =
+                ExtractOrbitLocation(text);
+
+            // If this is an orbit request and the orbit target
+            // itself is an ICAO, make sure that ICAO becomes
+            // the orbit location rather than being mistaken
+            // for the final destination.
+            if (string.Equals(
+                    request.RouteType,
+                    "ORBIT",
+                    StringComparison.OrdinalIgnoreCase) &&
+                LooksLikeIcao(request.OrbitLocation))
+            {
+                if (icaoCodes.Count >= 2)
+                {
+                    request.Destination = string.Empty;
+
+                    if (icaoCodes.Count >= 3)
+                        request.ReturnLocation = icaoCodes[^1];
+                }
+            }
 
             request.RequestedLocations =
                 ExtractRequestedLocations(
@@ -47,29 +65,6 @@ namespace H145FlightPlanner.Logic
 
         private static List<string> ExtractIcaoCodes(string text)
         {
-            /*
-             * IMPORTANT:
-             *
-             * We deliberately DO NOT convert the whole sentence
-             * to uppercase.
-             *
-             * Whisper normally writes aviation identifiers such
-             * as EGCK, EGFA, EGNS, EGQS in uppercase.
-             *
-             * Normal words such as:
-             *
-             * flight
-             * plan
-             * from
-             * then
-             *
-             * remain normal words and therefore cannot accidentally
-             * become ICAO identifiers.
-             *
-             * This is generic behaviour. There is no list of
-             * hardcoded airports or ignored English words here.
-             */
-
             MatchCollection matches =
                 Regex.Matches(
                     text,
@@ -77,7 +72,6 @@ namespace H145FlightPlanner.Logic
 
             return matches
                 .Select(match => match.Value)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
 
@@ -104,15 +98,6 @@ namespace H145FlightPlanner.Logic
 
         private static int? ExtractAltitude(string text)
         {
-            /*
-             * Handles:
-             *
-             * 1000 feet
-             * 1000 ft
-             * 1,000 feet
-             * 1500 foot
-             */
-
             Match match = Regex.Match(
                 text,
                 @"\b(\d{1,3}(?:,\d{3})+|\d{2,5})\s*(?:feet|foot|ft)\b",
@@ -124,27 +109,21 @@ namespace H145FlightPlanner.Logic
             string number =
                 match.Groups[1].Value.Replace(",", "");
 
-            if (int.TryParse(number, out int altitude))
+            if (int.TryParse(
+                number,
+                out int altitude))
+            {
                 return altitude;
+            }
 
             return null;
         }
 
         private static string DetectRouteType(string text)
         {
-            /*
-             * These are route concepts, not complete sentences.
-             *
-             * We are not teaching the program:
-             *
-             * "Create a flight plan from X to Y..."
-             *
-             * We are only detecting general route intentions.
-             */
-
             if (Regex.IsMatch(
                 text,
-                @"\borbit(?:s|ed|ing)?\b",
+                @"\b(?:orbit|orbiting|orbited|circle|circling|circle\s+around|fly\s+around)\b",
                 RegexOptions.IgnoreCase))
             {
                 return "ORBIT";
@@ -160,10 +139,18 @@ namespace H145FlightPlanner.Logic
 
             if (Regex.IsMatch(
                 text,
-                @"\bscenic\b|\bfly\s+around\b",
+                @"\bscenic\b",
                 RegexOptions.IgnoreCase))
             {
                 return "SCENIC";
+            }
+
+            if (Regex.IsMatch(
+                text,
+                @"\b(?:direct|directing|directly|straight\s+to)\b",
+                RegexOptions.IgnoreCase))
+            {
+                return "DIRECT";
             }
 
             return "DIRECT";
@@ -173,7 +160,7 @@ namespace H145FlightPlanner.Logic
         {
             Match match = Regex.Match(
                 text,
-                @"\borbit(?:s|ed|ing)?\s+(?:around\s+|over\s+)?(.+?)(?=,|\bthen\b|\breturn(?:ing)?\b|\bcontinue\b|$)",
+                @"\b(?:orbit|orbiting|orbited|circle|circling|circle\s+around|fly\s+around)\s+(?:around\s+|over\s+)?(.+?)(?=,|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bcontinue\b|$)",
                 RegexOptions.IgnoreCase);
 
             if (!match.Success)
@@ -192,25 +179,26 @@ namespace H145FlightPlanner.Logic
 
             foreach (string code in icaoCodes)
             {
-                if (!locations.Contains(
-                    code,
-                    StringComparer.OrdinalIgnoreCase))
-                {
-                    locations.Add(code);
-                }
+                locations.Add(code);
             }
 
             if (!string.IsNullOrWhiteSpace(orbitLocation))
             {
-                if (!locations.Contains(
-                    orbitLocation,
-                    StringComparer.OrdinalIgnoreCase))
-                {
-                    locations.Add(orbitLocation);
-                }
+                locations.Add(orbitLocation);
             }
 
             return locations;
+        }
+
+        private static bool LooksLikeIcao(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return Regex.IsMatch(
+                value.Trim(),
+                @"^[A-Z]{4}$",
+                RegexOptions.IgnoreCase);
         }
 
         private static string CleanLocation(string value)
