@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Net;
@@ -27,7 +28,8 @@ namespace H145FlightPlanner.Services
 
     public class AirportService
     {
-        private static readonly HttpClient HttpClient = CreateHttpClient();
+        private static readonly HttpClient HttpClient =
+            CreateHttpClient();
 
         private static readonly string[] OverpassEndpoints =
         {
@@ -36,6 +38,11 @@ namespace H145FlightPlanner.Services
             "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
         };
 
+        private static readonly ConcurrentDictionary<string, AirportResult>
+            AirportCache =
+                new ConcurrentDictionary<string, AirportResult>(
+                    StringComparer.OrdinalIgnoreCase);
+
         private static HttpClient CreateHttpClient()
         {
             var client = new HttpClient();
@@ -43,7 +50,8 @@ namespace H145FlightPlanner.Services
             client.DefaultRequestHeaders.UserAgent.ParseAdd(
                 "H145FlightPlanGenerator/1.0");
 
-            client.Timeout = TimeSpan.FromSeconds(35);
+            client.Timeout =
+                TimeSpan.FromSeconds(35);
 
             return client;
         }
@@ -58,6 +66,20 @@ namespace H145FlightPlanner.Services
             string cleanedIcao =
                 icao.Trim().ToUpperInvariant();
 
+            // -------------------------------------------------
+            // CACHE
+            //
+            // If we have already looked this airport up during
+            // this app session, return it immediately.
+            // -------------------------------------------------
+
+            if (AirportCache.TryGetValue(
+                cleanedIcao,
+                out AirportResult? cachedAirport))
+            {
+                return cachedAirport;
+            }
+
             string overpassQuery =
                 $"""
                 [out:json][timeout:20];
@@ -65,7 +87,8 @@ namespace H145FlightPlanner.Services
                 out center tags 1;
                 """;
 
-            var errors = new List<string>();
+            var errors =
+                new List<string>();
 
             foreach (string endpoint in OverpassEndpoints)
             {
@@ -79,7 +102,13 @@ namespace H145FlightPlanner.Services
                             cancellationToken);
 
                     if (result != null)
+                    {
+                        AirportCache.TryAdd(
+                            cleanedIcao,
+                            result);
+
                         return result;
+                    }
                 }
                 catch (OperationCanceledException)
                     when (!cancellationToken.IsCancellationRequested)
@@ -128,7 +157,8 @@ namespace H145FlightPlanner.Services
                     content,
                     cancellationToken);
 
-            if (IsTemporaryFailure(response.StatusCode))
+            if (IsTemporaryFailure(
+                response.StatusCode))
             {
                 throw new HttpRequestException(
                     $"Temporary server error: " +
@@ -158,7 +188,8 @@ namespace H145FlightPlanner.Services
                 return null;
             }
 
-            JsonElement element = elements[0];
+            JsonElement element =
+                elements[0];
 
             if (!TryGetCoordinates(
                 element,
@@ -168,35 +199,60 @@ namespace H145FlightPlanner.Services
                 return null;
             }
 
-            string name = cleanedIcao;
-            string aerowayType = string.Empty;
-            double elevationFeet = 0;
+            string name =
+                cleanedIcao;
+
+            string aerowayType =
+                string.Empty;
+
+            double elevationFeet =
+                0;
 
             if (element.TryGetProperty(
                 "tags",
                 out JsonElement tags))
             {
                 string osmName =
-                    GetString(tags, "name");
+                    GetString(
+                        tags,
+                        "name");
 
-                if (!string.IsNullOrWhiteSpace(osmName))
-                    name = osmName;
+                if (!string.IsNullOrWhiteSpace(
+                    osmName))
+                {
+                    name =
+                        osmName;
+                }
 
                 aerowayType =
-                    GetString(tags, "aeroway");
+                    GetString(
+                        tags,
+                        "aeroway");
 
                 elevationFeet =
-                    GetElevationFeet(tags);
+                    GetElevationFeet(
+                        tags);
             }
 
             return new AirportResult
             {
-                Ident = cleanedIcao,
-                Name = name,
-                Latitude = latitude,
-                Longitude = longitude,
-                ElevationFeet = elevationFeet,
-                AerowayType = aerowayType
+                Ident =
+                    cleanedIcao,
+
+                Name =
+                    name,
+
+                Latitude =
+                    latitude,
+
+                Longitude =
+                    longitude,
+
+                ElevationFeet =
+                    elevationFeet,
+
+                AerowayType =
+                    aerowayType
             };
         }
 
@@ -220,8 +276,11 @@ namespace H145FlightPlanner.Services
             out double latitude,
             out double longitude)
         {
-            latitude = 0;
-            longitude = 0;
+            latitude =
+                0;
+
+            longitude =
+                0;
 
             if (element.TryGetProperty(
                     "lat",
@@ -230,8 +289,11 @@ namespace H145FlightPlanner.Services
                     "lon",
                     out JsonElement lonElement))
             {
-                latitude = latElement.GetDouble();
-                longitude = lonElement.GetDouble();
+                latitude =
+                    latElement.GetDouble();
+
+                longitude =
+                    lonElement.GetDouble();
 
                 return true;
             }
@@ -247,8 +309,11 @@ namespace H145FlightPlanner.Services
                         "lon",
                         out lonElement))
                 {
-                    latitude = latElement.GetDouble();
-                    longitude = lonElement.GetDouble();
+                    latitude =
+                        latElement.GetDouble();
+
+                    longitude =
+                        lonElement.GetDouble();
 
                     return true;
                 }
@@ -268,19 +333,26 @@ namespace H145FlightPlanner.Services
                 return string.Empty;
             }
 
-            return property.GetString() ?? string.Empty;
+            return property.GetString() ??
+                   string.Empty;
         }
 
         private static double GetElevationFeet(
             JsonElement tags)
         {
             string elevation =
-                GetString(tags, "ele");
+                GetString(
+                    tags,
+                    "ele");
 
-            if (string.IsNullOrWhiteSpace(elevation))
+            if (string.IsNullOrWhiteSpace(
+                elevation))
+            {
                 return 0;
+            }
 
-            string value = elevation.Trim();
+            string value =
+                elevation.Trim();
 
             bool explicitlyFeet =
                 value.EndsWith(
@@ -290,20 +362,21 @@ namespace H145FlightPlanner.Services
                     "feet",
                     StringComparison.OrdinalIgnoreCase);
 
-            value = value
-                .Replace(
-                    "feet",
-                    "",
-                    StringComparison.OrdinalIgnoreCase)
-                .Replace(
-                    "ft",
-                    "",
-                    StringComparison.OrdinalIgnoreCase)
-                .Replace(
-                    "m",
-                    "",
-                    StringComparison.OrdinalIgnoreCase)
-                .Trim();
+            value =
+                value
+                    .Replace(
+                        "feet",
+                        "",
+                        StringComparison.OrdinalIgnoreCase)
+                    .Replace(
+                        "ft",
+                        "",
+                        StringComparison.OrdinalIgnoreCase)
+                    .Replace(
+                        "m",
+                        "",
+                        StringComparison.OrdinalIgnoreCase)
+                    .Trim();
 
             if (!double.TryParse(
                 value,
