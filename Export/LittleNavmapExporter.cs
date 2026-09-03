@@ -1,6 +1,5 @@
 using System;
 using System.Globalization;
-using System.IO;
 using System.Text;
 using System.Xml;
 using H145FlightPlanner.Models;
@@ -55,15 +54,17 @@ namespace H145FlightPlanner.Export
 
             writer.WriteStartElement("Flightplan");
 
-            // ---------------------------------------------
+            // -------------------------------------------------
             // HEADER
-            // ---------------------------------------------
+            // -------------------------------------------------
 
             writer.WriteStartElement("Header");
 
             writer.WriteElementString(
                 "FlightplanType",
-                flightPlan.FlightRules);
+                string.IsNullOrWhiteSpace(flightPlan.FlightRules)
+                    ? "VFR"
+                    : flightPlan.FlightRules.ToUpperInvariant());
 
             writer.WriteElementString(
                 "CruisingAlt",
@@ -78,7 +79,9 @@ namespace H145FlightPlanner.Export
 
             writer.WriteElementString(
                 "CreationDate",
-                DateTimeOffset.Now.ToString("yyyy-MM-ddTHH:mm:sszzz"));
+                DateTimeOffset.Now.ToString(
+                    "yyyy-MM-ddTHH:mm:sszzz",
+                    CultureInfo.InvariantCulture));
 
             writer.WriteElementString(
                 "FileVersion",
@@ -88,11 +91,33 @@ namespace H145FlightPlanner.Export
                 "ProgramName",
                 "H145 Flight Plan Generator");
 
+            writer.WriteElementString(
+                "ProgramVersion",
+                "1.0");
+
+            writer.WriteElementString(
+                "Documentation",
+                "https://www.littlenavmap.org/lnmpln.html");
+
             writer.WriteEndElement();
 
-            // ---------------------------------------------
+            // -------------------------------------------------
+            // NAVIGATION DATA
+            // -------------------------------------------------
+
+            writer.WriteStartElement("SimData");
+            writer.WriteAttributeString("Cycle", "1801");
+            writer.WriteString("NAVIGRAPH");
+            writer.WriteEndElement();
+
+            writer.WriteStartElement("NavData");
+            writer.WriteAttributeString("Cycle", "1801");
+            writer.WriteString("NAVIGRAPH");
+            writer.WriteEndElement();
+
+            // -------------------------------------------------
             // H145 AIRCRAFT PERFORMANCE
-            // ---------------------------------------------
+            // -------------------------------------------------
 
             writer.WriteStartElement("AircraftPerformance");
 
@@ -110,9 +135,9 @@ namespace H145FlightPlanner.Export
 
             writer.WriteEndElement();
 
-            // ---------------------------------------------
+            // -------------------------------------------------
             // WAYPOINTS
-            // ---------------------------------------------
+            // -------------------------------------------------
 
             writer.WriteStartElement("Waypoints");
 
