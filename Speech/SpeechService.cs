@@ -20,8 +20,11 @@ namespace H145FlightPlanner.Speech
             if (string.IsNullOrWhiteSpace(text))
                 return;
 
+            string pronunciationText =
+                PronunciationDictionary.Apply(text);
+
             _synthesizer.SpeakAsyncCancelAll();
-            _synthesizer.SpeakAsync(text);
+            _synthesizer.SpeakAsync(pronunciationText);
         }
 
         public void Stop()
