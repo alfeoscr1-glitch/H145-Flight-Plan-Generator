@@ -9,94 +9,231 @@ namespace H145FlightPlanner.Speech
 {
     public class WhisperSpeechService : IDisposable
     {
-        private readonly string _modelPath;
         private WhisperFactory? _factory;
         private WhisperProcessor? _processor;
 
-        public WhisperSpeechService(string modelPath)
-        {
-            _modelPath = modelPath;
+        private WaveInEvent? _waveIn;
+        private MemoryStream? _recordingStream;
+        private WaveFileWriter? _waveWriter;
 
-            if (!File.Exists(_modelPath))
-            {
-                throw new FileNotFoundException(
-                    "The Whisper model could not be found.",
-                    _modelPath);
-            }
+        private bool _isRecording;
 
-            _factory = WhisperFactory.FromPath(_modelPath);
+        public event EventHandler<string>? TranscriptionReceived;
+        public event EventHandler<string>? StatusChanged;
+        public event EventHandler<string>? SpeechError;
 
-            _processor = _factory
-                .CreateBuilder()
-                .WithLanguage("en")
-                .WithNoContext()
-                .Build();
-        }
-
-        public async Task<string> TranscribeAsync(
-            Stream wavStream,
+        public async Task InitializeAsync(
             CancellationToken cancellationToken = default)
         {
-            if (_processor == null)
-                throw new ObjectDisposedException(nameof(WhisperSpeechService));
-
-            using var memoryStream = new MemoryStream();
-
-            await wavStream.CopyToAsync(
-                memoryStream,
-                cancellationToken);
-
-            memoryStream.Position = 0;
-
-            string result = string.Empty;
-
-            await foreach (var segment in _processor.ProcessAsync(
-                memoryStream,
-                cancellationToken))
+            try
             {
-                if (!string.IsNullOrWhiteSpace(segment.Text))
-                {
-                    result += segment.Text;
-                }
-            }
+                StatusChanged?.Invoke(this, "Loading Whisper model...");
 
-            return result.Trim();
+                string modelPath =
+                    await WhisperModelManager.EnsureModelExistsAsync(
+                        cancellationToken);
+
+                _factory = WhisperFactory.FromPath(modelPath);
+
+                _processor = _factory
+                    .CreateBuilder()
+                    .WithLanguage("en")
+                    .Build();
+
+                StatusChanged?.Invoke(this, "Whisper ready");
+            }
+            catch (Exception ex)
+            {
+                SpeechError?.Invoke(
+                    this,
+                    $"Whisper could not be initialized: {ex.Message}");
+            }
         }
 
-        public static MemoryStream ConvertToWhisperWav(
-            IWaveProvider source)
+        public void StartListening()
         {
-            var output = new MemoryStream();
-
-            using (var writer = new WaveFileWriter(
-                output,
-                new WaveFormat(16000, 16, 1)))
+            if (_processor == null)
             {
-                byte[] buffer = new byte[4096];
-
-                int bytesRead;
-
-                while ((bytesRead = source.Read(
-                    buffer,
-                    0,
-                    buffer.Length)) > 0)
-                {
-                    writer.Write(buffer, 0, bytesRead);
-                }
-
-                writer.Flush();
+                SpeechError?.Invoke(
+                    this,
+                    "Whisper is not ready yet.");
+                return;
             }
 
-            output.Position = 0;
-            return output;
+            if (_isRecording)
+                return;
+
+            try
+            {
+                _recordingStream = new MemoryStream();
+
+                _waveWriter = new WaveFileWriter(
+                    _recordingStream,
+                    new WaveFormat(16000, 16, 1));
+
+                _waveIn = new WaveInEvent
+                {
+                    WaveFormat = new WaveFormat(16000, 16, 1),
+                    BufferMilliseconds = 100
+                };
+
+                _waveIn.DataAvailable += WaveIn_DataAvailable;
+                _waveIn.RecordingStopped += WaveIn_RecordingStopped;
+
+                _isRecording = true;
+
+                _waveIn.StartRecording();
+
+                StatusChanged?.Invoke(this, "Listening with Whisper");
+            }
+            catch (Exception ex)
+            {
+                CleanupRecording();
+
+                SpeechError?.Invoke(
+                    this,
+                    $"Microphone could not be started: {ex.Message}");
+            }
+        }
+
+        public void StopListening()
+        {
+            if (!_isRecording || _waveIn == null)
+                return;
+
+            try
+            {
+                StatusChanged?.Invoke(this, "Processing with Whisper...");
+
+                _waveIn.StopRecording();
+            }
+            catch (Exception ex)
+            {
+                CleanupRecording();
+
+                SpeechError?.Invoke(
+                    this,
+                    $"Microphone could not be stopped: {ex.Message}");
+            }
+        }
+
+        private void WaveIn_DataAvailable(
+            object? sender,
+            WaveInEventArgs e)
+        {
+            if (_waveWriter == null)
+                return;
+
+            _waveWriter.Write(
+                e.Buffer,
+                0,
+                e.BytesRecorded);
+
+            _waveWriter.Flush();
+        }
+
+        private async void WaveIn_RecordingStopped(
+            object? sender,
+            StoppedEventArgs e)
+        {
+            try
+            {
+                if (e.Exception != null)
+                {
+                    SpeechError?.Invoke(
+                        this,
+                        $"Microphone error: {e.Exception.Message}");
+
+                    CleanupRecording();
+                    return;
+                }
+
+                if (_recordingStream == null ||
+                    _waveWriter == null ||
+                    _processor == null)
+                {
+                    CleanupRecording();
+                    return;
+                }
+
+                _waveWriter.Flush();
+
+                _recordingStream.Position = 0;
+
+                string transcription = string.Empty;
+
+                await foreach (var segment in _processor.ProcessAsync(
+                    _recordingStream,
+                    CancellationToken.None))
+                {
+                    if (string.IsNullOrWhiteSpace(segment.Text))
+                        continue;
+
+                    transcription += segment.Text;
+                }
+
+                transcription = transcription.Trim();
+
+                if (!string.IsNullOrWhiteSpace(transcription))
+                {
+                    TranscriptionReceived?.Invoke(
+                        this,
+                        transcription);
+                }
+
+                StatusChanged?.Invoke(
+                    this,
+                    "Ready");
+            }
+            catch (Exception ex)
+            {
+                SpeechError?.Invoke(
+                    this,
+                    $"Whisper transcription failed: {ex.Message}");
+            }
+            finally
+            {
+                CleanupRecording();
+            }
+        }
+
+        private void CleanupRecording()
+        {
+            _isRecording = false;
+
+            if (_waveIn != null)
+            {
+                _waveIn.DataAvailable -= WaveIn_DataAvailable;
+                _waveIn.RecordingStopped -= WaveIn_RecordingStopped;
+                _waveIn.Dispose();
+                _waveIn = null;
+            }
+
+            _waveWriter?.Dispose();
+            _waveWriter = null;
+
+            _recordingStream?.Dispose();
+            _recordingStream = null;
         }
 
         public void Dispose()
         {
-            _processor?.Dispose();
-            _factory?.Dispose();
+            try
+            {
+                if (_waveIn != null)
+                    _waveIn.StopRecording();
+            }
+            catch
+            {
+                // Ignore shutdown errors.
+            }
 
+            CleanupRecording();
+
+            _processor?.Dispose();
             _processor = null;
+
+            _factory?.Dispose();
             _factory = null;
         }
     }
