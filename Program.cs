@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using H145FlightPlanner.Speech;
 
@@ -17,7 +18,7 @@ namespace H145FlightPlanner
 
     public class MainForm : Form
     {
-        private readonly SpeechService _speechService;
+        private readonly WhisperSpeechService _whisperService;
 
         private readonly TextBox _commandBox;
         private readonly Button _microphoneButton;
@@ -34,10 +35,11 @@ namespace H145FlightPlanner
 
         public MainForm()
         {
-            _speechService = new SpeechService();
+            _whisperService = new WhisperSpeechService();
 
-            _speechService.SpeechRecognized += OnSpeechRecognized;
-            _speechService.SpeechError += OnSpeechError;
+            _whisperService.TranscriptionReceived += OnTranscriptionReceived;
+            _whisperService.StatusChanged += OnWhisperStatusChanged;
+            _whisperService.SpeechError += OnWhisperError;
 
             Text = "H145 Flight Plan Generator";
             StartPosition = FormStartPosition.CenterScreen;
@@ -105,7 +107,9 @@ namespace H145FlightPlanner
                 Location = new Point(20, 65),
                 Size = new Size(910, 70),
                 Font = new Font("Segoe UI", 11),
-                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+                Anchor = AnchorStyles.Top |
+                         AnchorStyles.Left |
+                         AnchorStyles.Right,
                 PlaceholderText = "Type your flight plan here, or use the microphone..."
             };
 
@@ -131,9 +135,9 @@ namespace H145FlightPlanner
 
             _microphoneStatus = new Label
             {
-                Text = "Microphone ready",
+                Text = "Loading Whisper...",
                 AutoSize = true,
-                ForeColor = Color.DimGray,
+                ForeColor = Color.DarkOrange,
                 Location = new Point(460, 161),
                 Font = new Font("Segoe UI", 9, FontStyle.Regular)
             };
@@ -223,8 +227,10 @@ namespace H145FlightPlanner
                 Location = new Point(25, 480),
                 Size = new Size(950, 190),
                 Font = new Font("Segoe UI", 10, FontStyle.Bold),
-                Anchor = AnchorStyles.Top | AnchorStyles.Bottom |
-                         AnchorStyles.Left | AnchorStyles.Right
+                Anchor = AnchorStyles.Top |
+                         AnchorStyles.Bottom |
+                         AnchorStyles.Left |
+                         AnchorStyles.Right
             };
 
             _flightPlanBox = new TextBox
@@ -236,8 +242,10 @@ namespace H145FlightPlanner
                 Size = new Size(910, 90),
                 Font = new Font("Consolas", 10),
                 Text = "No flight plan generated yet.",
-                Anchor = AnchorStyles.Top | AnchorStyles.Bottom |
-                         AnchorStyles.Left | AnchorStyles.Right
+                Anchor = AnchorStyles.Top |
+                         AnchorStyles.Bottom |
+                         AnchorStyles.Left |
+                         AnchorStyles.Right
             };
 
             _exportButton = new Button
@@ -254,7 +262,7 @@ namespace H145FlightPlanner
             outputGroup.Controls.Add(_exportButton);
 
             // -------------------------------------------------
-            // ADD CONTROLS TO FORM
+            // ADD CONTROLS
             // -------------------------------------------------
 
             Controls.Add(header);
@@ -262,57 +270,90 @@ namespace H145FlightPlanner
             Controls.Add(routeGroup);
             Controls.Add(outputGroup);
 
+            Load += MainForm_Load;
             FormClosing += MainForm_FormClosing;
         }
 
-        private void MicrophoneButton_Click(object? sender, EventArgs e)
+        private async void MainForm_Load(
+            object? sender,
+            EventArgs e)
+        {
+            _microphoneButton.Enabled = false;
+
+            await _whisperService.InitializeAsync();
+
+            _microphoneButton.Enabled = true;
+        }
+
+        private void MicrophoneButton_Click(
+            object? sender,
+            EventArgs e)
         {
             if (_isListening)
             {
-                StopListening();
+                _whisperService.StopListening();
+
+                _isListening = false;
+
+                _microphoneButton.Text = "🎤 START SPEAKING";
             }
             else
             {
-                StartListening();
-            }
-        }
-
-        private void StartListening()
-        {
-            try
-            {
-                _speechService.StartListening();
+                _whisperService.StartListening();
 
                 _isListening = true;
+
                 _microphoneButton.Text = "🛑 STOP SPEAKING";
-                _microphoneStatus.Text = "Listening...";
-                _microphoneStatus.ForeColor = Color.DarkRed;
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show(
-                    ex.Message,
-                    "Speech Recognition Error",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
             }
         }
 
-        private void StopListening()
-        {
-            _speechService.StopListening();
-
-            _isListening = false;
-            _microphoneButton.Text = "🎤 START SPEAKING";
-            _microphoneStatus.Text = "Microphone ready";
-            _microphoneStatus.ForeColor = Color.DimGray;
-        }
-
-        private void OnSpeechRecognized(object? sender, string text)
+        private void OnWhisperStatusChanged(
+            object? sender,
+            string status)
         {
             if (InvokeRequired)
             {
-                Invoke(new Action(() => OnSpeechRecognized(sender, text)));
+                Invoke(new Action(() =>
+                    OnWhisperStatusChanged(sender, status)));
+
+                return;
+            }
+
+            _microphoneStatus.Text = status;
+
+            if (status.Contains(
+                "Listening",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                _microphoneStatus.ForeColor = Color.DarkRed;
+            }
+            else if (status.Contains(
+                "Processing",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                _microphoneStatus.ForeColor = Color.DarkOrange;
+            }
+            else if (status.Contains(
+                "Ready",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                _microphoneStatus.ForeColor = Color.DarkGreen;
+            }
+            else
+            {
+                _microphoneStatus.ForeColor = Color.DimGray;
+            }
+        }
+
+        private void OnTranscriptionReceived(
+            object? sender,
+            string text)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() =>
+                    OnTranscriptionReceived(sender, text)));
+
                 return;
             }
 
@@ -320,26 +361,42 @@ namespace H145FlightPlanner
                 return;
 
             if (!string.IsNullOrWhiteSpace(_commandBox.Text))
+            {
                 _commandBox.AppendText(" ");
+            }
 
-            _commandBox.AppendText(text);
+            _commandBox.AppendText(text.Trim());
+
             _commandBox.SelectionStart = _commandBox.Text.Length;
             _commandBox.ScrollToCaret();
         }
 
-        private void OnSpeechError(object? sender, string message)
+        private void OnWhisperError(
+            object? sender,
+            string message)
         {
             if (InvokeRequired)
             {
-                Invoke(new Action(() => OnSpeechError(sender, message)));
+                Invoke(new Action(() =>
+                    OnWhisperError(sender, message)));
+
                 return;
             }
 
-            _microphoneStatus.Text = "Speech recognition error";
+            _microphoneButton.Enabled = true;
+            _microphoneStatus.Text = "Whisper error";
             _microphoneStatus.ForeColor = Color.DarkRed;
+
+            MessageBox.Show(
+                message,
+                "Whisper Error",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
         }
 
-        private void GenerateButton_Click(object? sender, EventArgs e)
+        private void GenerateButton_Click(
+            object? sender,
+            EventArgs e)
         {
             if (string.IsNullOrWhiteSpace(_commandBox.Text))
             {
@@ -353,15 +410,18 @@ namespace H145FlightPlanner
             }
 
             MessageBox.Show(
-                "Speech input is working.\n\nFlight-plan generation will be added in a later stage.",
-                "Test",
+                "Whisper speech recognition is connected.\n\n" +
+                "Flight-plan generation will be added in a later stage.",
+                "Speech Test",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
         }
 
-        private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
+        private void MainForm_FormClosing(
+            object? sender,
+            FormClosingEventArgs e)
         {
-            _speechService.StopListening();
+            _whisperService.Dispose();
         }
     }
 }
