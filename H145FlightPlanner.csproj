@@ -10,9 +10,11 @@
 
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
-    <PublishSingleFile>true</PublishSingleFile>
 
     <Nullable>enable</Nullable>
+
+    <!-- Keep native Whisper runtime files outside the single EXE -->
+    <PublishSingleFile>false</PublishSingleFile>
   </PropertyGroup>
 
   <ItemGroup>
