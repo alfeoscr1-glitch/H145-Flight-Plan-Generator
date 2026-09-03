@@ -1,8 +1,9 @@
 using System;
 using System.Drawing;
+using System.IO;
 using System.Text;
-using System.Threading.Tasks;
 using System.Windows.Forms;
+using H145FlightPlanner.Export;
 using H145FlightPlanner.Logic;
 using H145FlightPlanner.Models;
 using H145FlightPlanner.Routing;
@@ -272,6 +273,8 @@ namespace H145FlightPlanner
                          AnchorStyles.Left
             };
 
+            _exportButton.Click += ExportButton_Click;
+
             outputGroup.Controls.Add(_flightPlanBox);
             outputGroup.Controls.Add(_exportButton);
 
@@ -340,6 +343,9 @@ namespace H145FlightPlanner
                     return;
                 }
 
+                _currentFlightPlan = null;
+                _exportButton.Enabled = false;
+
                 FlightPlanRequest request =
                     FlightPlanCommandParser.Parse(input);
 
@@ -366,8 +372,6 @@ namespace H145FlightPlanner
                     _flightPlanBox.Text =
                         "The request was understood, but this route type " +
                         "has not been implemented yet.";
-
-                    _exportButton.Enabled = false;
 
                     return;
                 }
@@ -429,6 +433,75 @@ namespace H145FlightPlanner
                 MessageBox.Show(
                     ex.Message,
                     "Flight Plan Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+
+        private void ExportButton_Click(
+            object? sender,
+            EventArgs e)
+        {
+            try
+            {
+                if (_currentFlightPlan == null ||
+                    _currentFlightPlan.Waypoints.Count < 2)
+                {
+                    MessageBox.Show(
+                        "Generate a flight plan before exporting.",
+                        "No Flight Plan",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+
+                    return;
+                }
+
+                RouteWaypoint departure =
+                    _currentFlightPlan.Waypoints[0];
+
+                RouteWaypoint destination =
+                    _currentFlightPlan.Waypoints[
+                        _currentFlightPlan.Waypoints.Count - 1];
+
+                string defaultFileName =
+                    $"{departure.Ident} to {destination.Ident}.lnmpln";
+
+                using var saveDialog = new SaveFileDialog
+                {
+                    Title = "Export Little Navmap Flight Plan",
+
+                    Filter =
+                        "Little Navmap Flight Plan (*.lnmpln)|*.lnmpln",
+
+                    DefaultExt = "lnmpln",
+
+                    AddExtension = true,
+
+                    FileName = defaultFileName,
+
+                    OverwritePrompt = true
+                };
+
+                if (saveDialog.ShowDialog(this) != DialogResult.OK)
+                    return;
+
+                LittleNavmapExporter.Export(
+                    _currentFlightPlan,
+                    saveDialog.FileName);
+
+                MessageBox.Show(
+                    $"Flight plan exported successfully.\r\n\r\n" +
+                    $"{saveDialog.FileName}",
+                    "Export Complete",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"The flight plan could not be exported.\r\n\r\n" +
+                    ex.Message,
+                    "Export Error",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
             }
