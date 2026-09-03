@@ -17,9 +17,23 @@ namespace H145FlightPlanner.Services
 
         public double Longitude { get; set; }
 
+        public double SouthLatitude { get; set; }
+
+        public double NorthLatitude { get; set; }
+
+        public double WestLongitude { get; set; }
+
+        public double EastLongitude { get; set; }
+
         public string OsmType { get; set; } = string.Empty;
 
         public long OsmId { get; set; }
+
+        public string PlaceType { get; set; } = string.Empty;
+
+        public bool HasBoundingBox =>
+            NorthLatitude > SouthLatitude &&
+            EastLongitude > WestLongitude;
     }
 
     public class GeographyService
@@ -45,7 +59,8 @@ namespace H145FlightPlanner.Services
             if (string.IsNullOrWhiteSpace(placeName))
                 return null;
 
-            string query = Uri.EscapeDataString(placeName.Trim());
+            string query =
+                Uri.EscapeDataString(placeName.Trim());
 
             string url =
                 $"https://nominatim.openstreetmap.org/search" +
@@ -111,10 +126,68 @@ namespace H145FlightPlanner.Services
                     GetString(result, "osm_type"),
 
                 OsmId =
-                    GetLong(result, "osm_id")
+                    GetLong(result, "osm_id"),
+
+                PlaceType =
+                    GetString(result, "type")
             };
 
+            ReadBoundingBox(
+                result,
+                geographyResult);
+
             return geographyResult;
+        }
+
+        private static void ReadBoundingBox(
+            JsonElement result,
+            GeographyResult geographyResult)
+        {
+            if (!result.TryGetProperty(
+                "boundingbox",
+                out JsonElement boundingBox))
+            {
+                return;
+            }
+
+            if (boundingBox.ValueKind != JsonValueKind.Array ||
+                boundingBox.GetArrayLength() < 4)
+            {
+                return;
+            }
+
+            if (!TryParseDouble(
+                boundingBox[0].GetString(),
+                out double south))
+            {
+                return;
+            }
+
+            if (!TryParseDouble(
+                boundingBox[1].GetString(),
+                out double north))
+            {
+                return;
+            }
+
+            if (!TryParseDouble(
+                boundingBox[2].GetString(),
+                out double west))
+            {
+                return;
+            }
+
+            if (!TryParseDouble(
+                boundingBox[3].GetString(),
+                out double east))
+            {
+                return;
+            }
+
+            geographyResult.SouthLatitude = south;
+            geographyResult.NorthLatitude = north;
+            geographyResult.WestLongitude = west;
+            geographyResult.EastLongitude = east;
         }
 
         private static bool TryGetDouble(
@@ -131,8 +204,15 @@ namespace H145FlightPlanner.Services
                 return false;
             }
 
-            string? text = property.GetString();
+            return TryParseDouble(
+                property.GetString(),
+                out value);
+        }
 
+        private static bool TryParseDouble(
+            string? text,
+            out double value)
+        {
             return double.TryParse(
                 text,
                 NumberStyles.Float,
