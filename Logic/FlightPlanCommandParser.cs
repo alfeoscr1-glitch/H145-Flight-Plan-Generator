@@ -12,21 +12,9 @@ namespace H145FlightPlanner.Logic
             new HashSet<string>(
                 new[]
                 {
-                    "BACK",
-                    "FROM",
-                    "THEN",
-                    "HEAD",
-                    "FLY",
-                    "OVER",
-                    "NEXT",
-                    "ONTO",
-                    "WITH",
-                    "MAKE",
-                    "TAKE",
-                    "LAND",
-                    "AREA",
-                    "CITY",
-                    "TOWN"
+                    "BACK","FROM","THEN","HEAD","FLY","OVER","NEXT",
+                    "ONTO","WITH","MAKE","TAKE","LAND","AREA","CITY",
+                    "TOWN","COAST"
                 },
                 StringComparer.OrdinalIgnoreCase);
 
@@ -43,106 +31,75 @@ namespace H145FlightPlanner.Logic
             request.FlightRules = ExtractFlightRules(text);
             request.AltitudeFeet = ExtractAltitude(text);
 
-            List<string> icaoCodes =
-                ExtractIcaoCodes(text);
+            List<string> icaoCodes = ExtractIcaoCodes(text);
 
             if (icaoCodes.Count > 0)
+                request.Departure = icaoCodes[0];
+
+            if (request.RouteType.Equals("COASTLINE", StringComparison.OrdinalIgnoreCase))
             {
-                request.Departure =
-                    icaoCodes[0];
-            }
+                request.CoastlineMode = DetectCoastlineMode(text);
+                request.CoastlineLocation = ExtractCoastlineLocation(text);
 
-            // -------------------------------------------------
-            // ORBIT
-            // -------------------------------------------------
+                if (icaoCodes.Count > 1)
+                    request.Destination = icaoCodes[1];
 
-            if (string.Equals(
-                request.RouteType,
-                "ORBIT",
-                StringComparison.OrdinalIgnoreCase))
-            {
-                request.OrbitLocation =
-                    ExtractOrbitLocation(text);
-
-                string? orbitIcao =
-                    ExtractOrbitIcao(text);
-
-                if (!string.IsNullOrWhiteSpace(orbitIcao))
-                {
-                    request.OrbitLocation =
-                        orbitIcao;
-                }
-
-                string returnIcao =
-                    ExtractReturnIcao(text);
+                string returnIcao = ExtractReturnIcao(text);
 
                 if (!string.IsNullOrWhiteSpace(returnIcao))
-                {
-                    request.ReturnLocation =
-                        returnIcao;
-                }
+                    request.ReturnLocation = returnIcao;
                 else if (ContainsReturnInstruction(text))
-                {
-                    request.ReturnLocation =
-                        request.Departure;
-                }
-
-                request.Destination =
-                    ExtractContinueDestination(text);
+                    request.ReturnLocation = request.Departure;
             }
+            else if (request.RouteType.Equals("ORBIT", StringComparison.OrdinalIgnoreCase))
+            {
+                request.OrbitLocation = ExtractOrbitLocation(text);
 
-            // -------------------------------------------------
-            // DIRECT
-            // -------------------------------------------------
+                string? orbitIcao = ExtractOrbitIcao(text);
+                if (!string.IsNullOrWhiteSpace(orbitIcao))
+                    request.OrbitLocation = orbitIcao;
 
-            else if (string.Equals(
-                request.RouteType,
-                "DIRECT",
-                StringComparison.OrdinalIgnoreCase))
+                string returnIcao = ExtractReturnIcao(text);
+                if (!string.IsNullOrWhiteSpace(returnIcao))
+                    request.ReturnLocation = returnIcao;
+                else if (ContainsReturnInstruction(text))
+                    request.ReturnLocation = request.Departure;
+
+                request.Destination = ExtractContinueDestination(text);
+            }
+            else if (request.RouteType.Equals("DIRECT", StringComparison.OrdinalIgnoreCase))
             {
                 if (icaoCodes.Count > 1)
-                {
-                    request.Destination =
-                        icaoCodes[1];
-                }
+                    request.Destination = icaoCodes[1];
             }
-
-            // -------------------------------------------------
-            // OTHER ROUTE TYPES
-            // -------------------------------------------------
-
-            else
+            else if (icaoCodes.Count > 1)
             {
-                if (icaoCodes.Count > 1)
-                {
-                    request.Destination =
-                        icaoCodes[^1];
-                }
+                request.Destination = icaoCodes[^1];
             }
 
             request.RequestedLocations =
                 BuildRequestedLocations(
                     icaoCodes,
-                    request.OrbitLocation);
+                    request.OrbitLocation,
+                    request.CoastlineLocation);
 
             return request;
         }
 
-        private static string DetectRouteType(
-            string text)
+        private static string DetectRouteType(string text)
         {
-            // ORBIT
+            // Coastline first so "around the coastline" never becomes Orbit.
             if (Regex.IsMatch(
                 text,
-                @"\b(?:orbit|orbits|orbited|orbiting)\b",
+                @"\b(?:coast|coastline|coastal|shoreline|seaboard|sea\s+coast)\b",
                 RegexOptions.IgnoreCase))
             {
-                return "ORBIT";
+                return "COASTLINE";
             }
 
             if (Regex.IsMatch(
                 text,
-                @"\b(?:circle|circles|circled|circling)\b",
+                @"\b(?:orbit|orbits|orbited|orbiting|circle|circles|circled|circling)\b",
                 RegexOptions.IgnoreCase))
             {
                 return "ORBIT";
@@ -156,16 +113,6 @@ namespace H145FlightPlanner.Logic
                 return "ORBIT";
             }
 
-            // COASTLINE
-            if (Regex.IsMatch(
-                text,
-                @"\bcoast(?:line|al)?\b",
-                RegexOptions.IgnoreCase))
-            {
-                return "COASTLINE";
-            }
-
-            // SCENIC
             if (Regex.IsMatch(
                 text,
                 @"\bscenic\b|\bsightseeing\b",
@@ -174,18 +121,9 @@ namespace H145FlightPlanner.Logic
                 return "SCENIC";
             }
 
-            // DIRECT
             if (Regex.IsMatch(
                 text,
-                @"\b(?:direct|directly|directing|directed)\b",
-                RegexOptions.IgnoreCase))
-            {
-                return "DIRECT";
-            }
-
-            if (Regex.IsMatch(
-                text,
-                @"\bstraight\s+to\b",
+                @"\b(?:direct|directly|directing|directed)\b|\bstraight\s+to\b",
                 RegexOptions.IgnoreCase))
             {
                 return "DIRECT";
@@ -194,8 +132,48 @@ namespace H145FlightPlanner.Logic
             return "DIRECT";
         }
 
-        private static List<string> ExtractIcaoCodes(
-            string text)
+        private static string DetectCoastlineMode(string text)
+        {
+            if (Regex.IsMatch(
+                text,
+                @"\b(?:around|round|rounding|circle|circling)\b",
+                RegexOptions.IgnoreCase))
+            {
+                return "AROUND";
+            }
+
+            return "ALONG";
+        }
+
+        private static string ExtractCoastlineLocation(string text)
+        {
+            string[] patterns =
+            {
+                @"\b(?:around|round|circle|circling)\s+(?:the\s+)?(?:coast|coastline|shoreline)\s+(?:of\s+)?(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bfly\s+back\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))",
+                @"\b(?:follow|following|fly|flying)\s+(?:the\s+)?(?:coast|coastline|shoreline)\s+(?:around|round)\s+(?:the\s+)?(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bfly\s+back\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))",
+                @"\b(?:coast|coastline|shoreline)\s+of\s+(?:the\s+)?(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bfly\s+back\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))"
+            };
+
+            foreach (string pattern in patterns)
+            {
+                Match match = Regex.Match(text, pattern, RegexOptions.IgnoreCase);
+                if (match.Success)
+                {
+                    string place = CleanLocation(match.Groups["place"].Value);
+                    place = Regex.Replace(
+                        place,
+                        @"^(?:the\s+)",
+                        string.Empty,
+                        RegexOptions.IgnoreCase);
+
+                    return place.Trim();
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private static List<string> ExtractIcaoCodes(string text)
         {
             MatchCollection matches =
                 Regex.Matches(
@@ -203,37 +181,23 @@ namespace H145FlightPlanner.Logic
                     @"(?<![A-Za-z0-9])[A-Z]{4}(?![A-Za-z0-9])");
 
             return matches
-                .Select(match =>
-                    match.Value.ToUpperInvariant())
-                .Where(code =>
-                    !ReservedWords.Contains(code))
+                .Select(match => match.Value.ToUpperInvariant())
+                .Where(code => !ReservedWords.Contains(code))
                 .ToList();
         }
 
-        private static string ExtractFlightRules(
-            string text)
+        private static string ExtractFlightRules(string text)
         {
-            if (Regex.IsMatch(
-                text,
-                @"\bVFR\b",
-                RegexOptions.IgnoreCase))
-            {
+            if (Regex.IsMatch(text, @"\bVFR\b", RegexOptions.IgnoreCase))
                 return "VFR";
-            }
 
-            if (Regex.IsMatch(
-                text,
-                @"\bIFR\b",
-                RegexOptions.IgnoreCase))
-            {
+            if (Regex.IsMatch(text, @"\bIFR\b", RegexOptions.IgnoreCase))
                 return "IFR";
-            }
 
             return string.Empty;
         }
 
-        private static int? ExtractAltitude(
-            string text)
+        private static int? ExtractAltitude(string text)
         {
             Match match = Regex.Match(
                 text,
@@ -243,40 +207,26 @@ namespace H145FlightPlanner.Logic
             if (!match.Success)
                 return null;
 
-            string number =
-                match.Groups[1]
-                    .Value
-                    .Replace(",", "");
+            string number = match.Groups[1].Value.Replace(",", "");
 
-            if (int.TryParse(
-                number,
-                out int altitude))
-            {
-                return altitude;
-            }
-
-            return null;
+            return int.TryParse(number, out int altitude)
+                ? altitude
+                : null;
         }
 
-        private static string ExtractOrbitLocation(
-            string text)
+        private static string ExtractOrbitLocation(string text)
         {
             Match match = Regex.Match(
                 text,
                 @"\b(?:orbit|orbits|orbited|orbiting|circle|circles|circled|circling)\b\s*(?:around\s+|over\s+)?(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bfly\s+back\b|\bcontinue\b|\bproceed\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))",
                 RegexOptions.IgnoreCase);
 
-            if (match.Success)
-            {
-                return CleanLocation(
-                    match.Groups["place"].Value);
-            }
-
-            return string.Empty;
+            return match.Success
+                ? CleanLocation(match.Groups["place"].Value)
+                : string.Empty;
         }
 
-        private static string? ExtractOrbitIcao(
-            string text)
+        private static string? ExtractOrbitIcao(string text)
         {
             Match match = Regex.Match(
                 text,
@@ -286,19 +236,12 @@ namespace H145FlightPlanner.Logic
             if (!match.Success)
                 return null;
 
-            string code =
-                match.Groups["icao"]
-                    .Value
-                    .ToUpperInvariant();
+            string code = match.Groups["icao"].Value.ToUpperInvariant();
 
-            if (ReservedWords.Contains(code))
-                return null;
-
-            return code;
+            return ReservedWords.Contains(code) ? null : code;
         }
 
-        private static string ExtractReturnIcao(
-            string text)
+        private static string ExtractReturnIcao(string text)
         {
             Match match = Regex.Match(
                 text,
@@ -308,19 +251,12 @@ namespace H145FlightPlanner.Logic
             if (!match.Success)
                 return string.Empty;
 
-            string code =
-                match.Groups["icao"]
-                    .Value
-                    .ToUpperInvariant();
+            string code = match.Groups["icao"].Value.ToUpperInvariant();
 
-            if (ReservedWords.Contains(code))
-                return string.Empty;
-
-            return code;
+            return ReservedWords.Contains(code) ? string.Empty : code;
         }
 
-        private static string ExtractContinueDestination(
-            string text)
+        private static string ExtractContinueDestination(string text)
         {
             Match match = Regex.Match(
                 text,
@@ -338,19 +274,12 @@ namespace H145FlightPlanner.Logic
             if (!match.Success)
                 return string.Empty;
 
-            string code =
-                match.Groups["icao"]
-                    .Value
-                    .ToUpperInvariant();
+            string code = match.Groups["icao"].Value.ToUpperInvariant();
 
-            if (ReservedWords.Contains(code))
-                return string.Empty;
-
-            return code;
+            return ReservedWords.Contains(code) ? string.Empty : code;
         }
 
-        private static bool ContainsReturnInstruction(
-            string text)
+        private static bool ContainsReturnInstruction(string text)
         {
             return Regex.IsMatch(
                 text,
@@ -360,10 +289,10 @@ namespace H145FlightPlanner.Logic
 
         private static List<string> BuildRequestedLocations(
             List<string> icaoCodes,
-            string orbitLocation)
+            string orbitLocation,
+            string coastlineLocation)
         {
-            var locations =
-                new List<string>();
+            var locations = new List<string>();
 
             foreach (string icao in icaoCodes)
             {
@@ -375,24 +304,23 @@ namespace H145FlightPlanner.Logic
                 }
             }
 
-            if (!string.IsNullOrWhiteSpace(
-                orbitLocation) &&
-                !locations.Contains(
-                    orbitLocation,
-                    StringComparer.OrdinalIgnoreCase))
+            foreach (string place in new[] { orbitLocation, coastlineLocation })
             {
-                locations.Add(
-                    orbitLocation);
+                if (!string.IsNullOrWhiteSpace(place) &&
+                    !locations.Contains(
+                        place,
+                        StringComparer.OrdinalIgnoreCase))
+                {
+                    locations.Add(place);
+                }
             }
 
             return locations;
         }
 
-        private static string CleanLocation(
-            string value)
+        private static string CleanLocation(string value)
         {
-            string cleaned =
-                value.Trim();
+            string cleaned = value.Trim();
 
             cleaned = Regex.Replace(
                 cleaned,
