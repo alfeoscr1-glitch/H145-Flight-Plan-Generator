@@ -1,6 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
+using System.Net;
 using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -26,6 +29,13 @@ namespace H145FlightPlanner.Services
     {
         private static readonly HttpClient HttpClient = CreateHttpClient();
 
+        private static readonly string[] OverpassEndpoints =
+        {
+            "https://overpass-api.de/api/interpreter",
+            "https://overpass.private.coffee/api/interpreter",
+            "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+        };
+
         private static HttpClient CreateHttpClient()
         {
             var client = new HttpClient();
@@ -33,7 +43,7 @@ namespace H145FlightPlanner.Services
             client.DefaultRequestHeaders.UserAgent.ParseAdd(
                 "H145FlightPlanGenerator/1.0");
 
-            client.Timeout = TimeSpan.FromSeconds(30);
+            client.Timeout = TimeSpan.FromSeconds(35);
 
             return client;
         }
@@ -50,24 +60,81 @@ namespace H145FlightPlanner.Services
 
             string overpassQuery =
                 $"""
-                [out:json][timeout:25];
-                (
-                  nwr["icao"="{cleanedIcao}"]["aeroway"];
-                );
+                [out:json][timeout:20];
+                nwr["icao"="{cleanedIcao}"]["aeroway"];
                 out center tags 1;
                 """;
 
-            string url =
-                "https://overpass-api.de/api/interpreter";
+            var errors = new List<string>();
 
+            foreach (string endpoint in OverpassEndpoints)
+            {
+                try
+                {
+                    AirportResult? result =
+                        await TryEndpointAsync(
+                            endpoint,
+                            overpassQuery,
+                            cleanedIcao,
+                            cancellationToken);
+
+                    if (result != null)
+                        return result;
+                }
+                catch (OperationCanceledException)
+                    when (!cancellationToken.IsCancellationRequested)
+                {
+                    errors.Add(
+                        $"{endpoint}: request timed out");
+                }
+                catch (HttpRequestException ex)
+                {
+                    errors.Add(
+                        $"{endpoint}: {ex.Message}");
+                }
+                catch (JsonException ex)
+                {
+                    errors.Add(
+                        $"{endpoint}: invalid response ({ex.Message})");
+                }
+            }
+
+            if (errors.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    $"Airport {cleanedIcao} could not be looked up because " +
+                    $"all OpenStreetMap servers were unavailable.\r\n\r\n" +
+                    string.Join("\r\n", errors));
+            }
+
+            return null;
+        }
+
+        private static async Task<AirportResult?> TryEndpointAsync(
+            string endpoint,
+            string overpassQuery,
+            string cleanedIcao,
+            CancellationToken cancellationToken)
+        {
             using var content =
-                new StringContent(overpassQuery);
+                new StringContent(
+                    overpassQuery,
+                    Encoding.UTF8,
+                    "application/x-www-form-urlencoded");
 
             using HttpResponseMessage response =
                 await HttpClient.PostAsync(
-                    url,
+                    endpoint,
                     content,
                     cancellationToken);
+
+            if (IsTemporaryFailure(response.StatusCode))
+            {
+                throw new HttpRequestException(
+                    $"Temporary server error: " +
+                    $"{(int)response.StatusCode} " +
+                    $"{response.ReasonPhrase}");
+            }
 
             response.EnsureSuccessStatusCode();
 
@@ -109,11 +176,11 @@ namespace H145FlightPlanner.Services
                 "tags",
                 out JsonElement tags))
             {
-                name =
+                string osmName =
                     GetString(tags, "name");
 
-                if (string.IsNullOrWhiteSpace(name))
-                    name = cleanedIcao;
+                if (!string.IsNullOrWhiteSpace(osmName))
+                    name = osmName;
 
                 aerowayType =
                     GetString(tags, "aeroway");
@@ -131,6 +198,21 @@ namespace H145FlightPlanner.Services
                 ElevationFeet = elevationFeet,
                 AerowayType = aerowayType
             };
+        }
+
+        private static bool IsTemporaryFailure(
+            HttpStatusCode statusCode)
+        {
+            return statusCode ==
+                       HttpStatusCode.RequestTimeout ||
+                   statusCode ==
+                       HttpStatusCode.TooManyRequests ||
+                   statusCode ==
+                       HttpStatusCode.BadGateway ||
+                   statusCode ==
+                       HttpStatusCode.ServiceUnavailable ||
+                   statusCode ==
+                       HttpStatusCode.GatewayTimeout;
         }
 
         private static bool TryGetCoordinates(
@@ -198,21 +280,43 @@ namespace H145FlightPlanner.Services
             if (string.IsNullOrWhiteSpace(elevation))
                 return 0;
 
-            string numericPart =
-                elevation
-                    .Replace("m", "", StringComparison.OrdinalIgnoreCase)
-                    .Trim();
+            string value = elevation.Trim();
+
+            bool explicitlyFeet =
+                value.EndsWith(
+                    "ft",
+                    StringComparison.OrdinalIgnoreCase) ||
+                value.EndsWith(
+                    "feet",
+                    StringComparison.OrdinalIgnoreCase);
+
+            value = value
+                .Replace(
+                    "feet",
+                    "",
+                    StringComparison.OrdinalIgnoreCase)
+                .Replace(
+                    "ft",
+                    "",
+                    StringComparison.OrdinalIgnoreCase)
+                .Replace(
+                    "m",
+                    "",
+                    StringComparison.OrdinalIgnoreCase)
+                .Trim();
 
             if (!double.TryParse(
-                numericPart,
+                value,
                 NumberStyles.Float,
                 CultureInfo.InvariantCulture,
-                out double metres))
+                out double elevationValue))
             {
                 return 0;
             }
 
-            return metres * 3.28084;
+            return explicitlyFeet
+                ? elevationValue
+                : elevationValue * 3.28084;
         }
     }
 }
