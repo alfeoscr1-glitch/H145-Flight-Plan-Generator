@@ -92,36 +92,6 @@ namespace H145FlightPlanner.Logic
             }
 
             // -------------------------------------------------
-            // AROUND
-            // -------------------------------------------------
-
-            else if (string.Equals(
-                request.RouteType,
-                "AROUND",
-                StringComparison.OrdinalIgnoreCase))
-            {
-                request.AroundLocation =
-                    ExtractAroundLocation(text);
-
-                string returnIcao =
-                    ExtractReturnIcao(text);
-
-                if (!string.IsNullOrWhiteSpace(returnIcao))
-                {
-                    request.ReturnLocation =
-                        returnIcao;
-                }
-                else if (ContainsReturnInstruction(text))
-                {
-                    request.ReturnLocation =
-                        request.Departure;
-                }
-
-                request.Destination =
-                    ExtractContinueDestination(text);
-            }
-
-            // -------------------------------------------------
             // DIRECT
             // -------------------------------------------------
 
@@ -153,8 +123,7 @@ namespace H145FlightPlanner.Logic
             request.RequestedLocations =
                 BuildRequestedLocations(
                     icaoCodes,
-                    request.OrbitLocation,
-                    request.AroundLocation);
+                    request.OrbitLocation);
 
             return request;
         }
@@ -185,15 +154,6 @@ namespace H145FlightPlanner.Logic
                 RegexOptions.IgnoreCase))
             {
                 return "ORBIT";
-            }
-
-            // AROUND
-            if (Regex.IsMatch(
-                text,
-                @"\b(?:go\s+around|going\s+around|fly\s+around|flying\s+around|around|rounding|round)\b",
-                RegexOptions.IgnoreCase))
-            {
-                return "AROUND";
             }
 
             // COASTLINE
@@ -315,21 +275,6 @@ namespace H145FlightPlanner.Logic
             return string.Empty;
         }
 
-        private static string ExtractAroundLocation(
-            string text)
-        {
-            Match match = Regex.Match(
-                text,
-                @"\b(?:go\s+around|going\s+around|fly\s+around|flying\s+around|around|rounding|round)\b\s+(?:the\s+)?(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bfly\s+back\b|\bcontinue\b|\bproceed\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))",
-                RegexOptions.IgnoreCase);
-
-            if (!match.Success)
-                return string.Empty;
-
-            return CleanLocation(
-                match.Groups["place"].Value);
-        }
-
         private static string? ExtractOrbitIcao(
             string text)
         {
@@ -415,8 +360,7 @@ namespace H145FlightPlanner.Logic
 
         private static List<string> BuildRequestedLocations(
             List<string> icaoCodes,
-            string orbitLocation,
-            string aroundLocation)
+            string orbitLocation)
         {
             var locations =
                 new List<string>();
@@ -439,16 +383,6 @@ namespace H145FlightPlanner.Logic
             {
                 locations.Add(
                     orbitLocation);
-            }
-
-            if (!string.IsNullOrWhiteSpace(
-                aroundLocation) &&
-                !locations.Contains(
-                    aroundLocation,
-                    StringComparer.OrdinalIgnoreCase))
-            {
-                locations.Add(
-                    aroundLocation);
             }
 
             return locations;
