@@ -68,11 +68,12 @@ namespace H145FlightPlanner.Routing
                     ? "VFR"
                     : request.FlightRules.ToUpperInvariant();
 
-            var flightPlan = new GeneratedFlightPlan
-            {
-                FlightRules = flightRules,
-                CruisingAltitudeFeet = altitude
-            };
+            var flightPlan =
+                new GeneratedFlightPlan
+                {
+                    FlightRules = flightRules,
+                    CruisingAltitudeFeet = altitude
+                };
 
             // -------------------------------------------------
             // DEPARTURE
@@ -166,8 +167,8 @@ namespace H145FlightPlanner.Routing
             double halfLongitude =
                 (area.EastLongitude - area.WestLongitude) / 2.0;
 
-            // Slightly expand the returned area so the route
-            // goes around the outside rather than through it.
+            // Keep the route slightly outside the area's
+            // returned bounds.
             halfLatitude *= 1.08;
             halfLongitude *= 1.08;
 
@@ -184,23 +185,26 @@ namespace H145FlightPlanner.Routing
                 centreLongitude - halfLongitude;
 
             // -------------------------------------------------
-            // MINIMUM PRACTICAL LOOP
+            // MINIMUM PRACTICAL OUTSIDE LOOP
             //
-            // Use only four unique points around the area.
-            // WP5 repeats WP1 to close the loop completely.
+            // Four unique corner waypoints keep the waypoint
+            // count very low while ensuring that the straight
+            // legs remain outside/around the area's bounds.
+            //
+            // WP5 repeats WP1 to close the loop.
             // -------------------------------------------------
 
             AddWaypoint(
                 flightPlan,
                 "WP1",
                 north,
-                centreLongitude,
+                west,
                 altitude);
 
             AddWaypoint(
                 flightPlan,
                 "WP2",
-                centreLatitude,
+                north,
                 east,
                 altitude);
 
@@ -208,13 +212,13 @@ namespace H145FlightPlanner.Routing
                 flightPlan,
                 "WP3",
                 south,
-                centreLongitude,
+                east,
                 altitude);
 
             AddWaypoint(
                 flightPlan,
                 "WP4",
-                centreLatitude,
+                south,
                 west,
                 altitude);
 
@@ -222,7 +226,7 @@ namespace H145FlightPlanner.Routing
                 flightPlan,
                 "WP5",
                 north,
-                centreLongitude,
+                west,
                 altitude);
         }
 
@@ -232,8 +236,6 @@ namespace H145FlightPlanner.Routing
             double centreLongitude,
             int altitude)
         {
-            // Used only if the place lookup does not provide
-            // a usable bounding area.
             const double radiusNm = 2.0;
 
             double latitudeRadius =
@@ -259,39 +261,51 @@ namespace H145FlightPlanner.Routing
                     (60.0 * cosine);
             }
 
+            double north =
+                centreLatitude + latitudeRadius;
+
+            double south =
+                centreLatitude - latitudeRadius;
+
+            double east =
+                centreLongitude + longitudeRadius;
+
+            double west =
+                centreLongitude - longitudeRadius;
+
             AddWaypoint(
                 flightPlan,
                 "WP1",
-                centreLatitude + latitudeRadius,
-                centreLongitude,
+                north,
+                west,
                 altitude);
 
             AddWaypoint(
                 flightPlan,
                 "WP2",
-                centreLatitude,
-                centreLongitude + longitudeRadius,
+                north,
+                east,
                 altitude);
 
             AddWaypoint(
                 flightPlan,
                 "WP3",
-                centreLatitude - latitudeRadius,
-                centreLongitude,
+                south,
+                east,
                 altitude);
 
             AddWaypoint(
                 flightPlan,
                 "WP4",
-                centreLatitude,
-                centreLongitude - longitudeRadius,
+                south,
+                west,
                 altitude);
 
             AddWaypoint(
                 flightPlan,
                 "WP5",
-                centreLatitude + latitudeRadius,
-                centreLongitude,
+                north,
+                west,
                 altitude);
         }
 
