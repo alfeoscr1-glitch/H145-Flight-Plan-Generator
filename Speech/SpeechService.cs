@@ -1,95 +1,59 @@
 using System;
-using Microsoft.CognitiveServices.Speech;
-using Microsoft.CognitiveServices.Speech.Audio;
+using System.Speech.Recognition;
 
 namespace H145FlightPlanner.Speech
 {
     public class SpeechService
     {
-        private SpeechRecognizer? _recognizer;
+        private readonly SpeechRecognitionEngine _recognizer;
+        private readonly Grammar _dictationGrammar;
+        private readonly Grammar _aviationGrammar;
 
         public event EventHandler<string>? SpeechRecognized;
         public event EventHandler<string>? SpeechError;
 
-        public async void StartListening()
+        public SpeechService()
         {
             try
             {
-                string key = SpeechConfiguration.SpeechKey;
-                string region = SpeechConfiguration.SpeechRegion;
+                _recognizer = new SpeechRecognitionEngine();
 
-                if (string.IsNullOrWhiteSpace(key) ||
-                    string.IsNullOrWhiteSpace(region))
+                // Use the Windows default microphone.
+                _recognizer.SetInputToDefaultAudioDevice();
+
+                // General free-form speech.
+                _dictationGrammar = new DictationGrammar
                 {
-                    SpeechError?.Invoke(
-                        this,
-                        "Azure Speech is not configured yet.");
-                    return;
-                }
+                    Name = "General Dictation"
+                };
 
-                var speechConfig =
-                    SpeechConfig.FromSubscription(key, region);
+                _recognizer.LoadGrammar(_dictationGrammar);
 
-                speechConfig.SpeechRecognitionLanguage = "en-GB";
+                // Aviation-specific grammar.
+                _aviationGrammar = BuildAviationGrammar();
 
-                using var audioConfig =
-                    AudioConfig.FromDefaultMicrophoneInput();
+                _recognizer.LoadGrammar(_aviationGrammar);
 
-                _recognizer = new SpeechRecognizer(
-                    speechConfig,
-                    audioConfig);
-
-                var phraseList =
-                    PhraseListGrammar.FromRecognizer(_recognizer);
-
-                phraseList.SetWeight(2.0);
-
-                phraseList.AddPhrase("EGCK");
-                phraseList.AddPhrase("EGFA");
-                phraseList.AddPhrase("EGPH");
-                phraseList.AddPhrase("EGFF");
-                phraseList.AddPhrase("EGNT");
-                phraseList.AddPhrase("EGPB");
-
-                phraseList.AddPhrase("H145");
-                phraseList.AddPhrase("Little Navmap");
-                phraseList.AddPhrase("flight plan");
-                phraseList.AddPhrase("departure");
-                phraseList.AddPhrase("destination");
-                phraseList.AddPhrase("direct");
-                phraseList.AddPhrase("orbit");
-                phraseList.AddPhrase("coastline");
-                phraseList.AddPhrase("coastal route");
-                phraseList.AddPhrase("fly around");
-                phraseList.AddPhrase("scenic route");
-
-                phraseList.AddPhrase("Anglesey");
-                phraseList.AddPhrase("Fishguard");
-                phraseList.AddPhrase("Pembrokeshire");
-                phraseList.AddPhrase("Aberystwyth");
-
-                _recognizer.Recognized += Recognizer_Recognized;
-
-                await _recognizer.StartContinuousRecognitionAsync();
+                _recognizer.SpeechRecognized += Recognizer_SpeechRecognized;
+                _recognizer.SpeechRecognitionRejected += Recognizer_SpeechRecognitionRejected;
             }
             catch (Exception ex)
             {
-                SpeechError?.Invoke(this, ex.Message);
+                throw new InvalidOperationException(
+                    "Windows speech recognition could not be started. " +
+                    "Make sure Windows has a microphone available.",
+                    ex);
             }
         }
 
-        public async void StopListening()
+        public void StartListening()
         {
             try
             {
-                if (_recognizer == null)
-                    return;
+                _recognizer.RecognizeAsyncCancel();
 
-                await _recognizer.StopContinuousRecognitionAsync();
-
-                _recognizer.Recognized -= Recognizer_Recognized;
-                _recognizer.Dispose();
-                _recognizer = null;
+                _recognizer.RecognizeAsync(
+                    RecognizeMode.Multiple);
             }
             catch (Exception ex)
             {
@@ -97,14 +61,88 @@ namespace H145FlightPlanner.Speech
             }
         }
 
-        private void Recognizer_Recognized(
+        public void StopListening()
+        {
+            try
+            {
+                _recognizer.RecognizeAsyncCancel();
+            }
+            catch (Exception ex)
+            {
+                SpeechError?.Invoke(this, ex.Message);
+            }
+        }
+
+        private Grammar BuildAviationGrammar()
+        {
+            var builder = new GrammarBuilder();
+
+            var commands = new Choices(
+                "create a flight plan",
+                "get a flight plan",
+                "make a flight plan"
+            );
+
+            var starting = new Choices(
+                "starting from",
+                "start from",
+                "starting at",
+                "start at",
+                "departing from",
+                "departure from"
+            );
+
+            var ending = new Choices(
+                "and ending at",
+                "ending at",
+                "end at",
+                "and end at",
+                "arriving at",
+                "destination"
+            );
+
+            // Common ways of saying EGCK.
+            var egck = new Choices(
+                "EGCK",
+                "E G C K",
+                "E G C K airport",
+                "Echo Golf Charlie Kilo",
+                "Echo Golf Charlie Kilo airport"
+            );
+
+            // Common ways of saying EGFA.
+            var egfa = new Choices(
+                "EGFA",
+                "E G F A",
+                "E G F A airport",
+                "Echo Golf Foxtrot Alpha",
+                "Echo Golf Foxtrot Alpha airport"
+            );
+
+            var egckOrEgfa = new Choices();
+            egckOrEgfa.Add(egck);
+            egckOrEgfa.Add(egfa);
+
+            builder.Append(commands);
+            builder.Append(starting);
+            builder.Append(egckOrEgfa);
+            builder.Append(ending);
+            builder.Append(egckOrEgfa);
+
+            return new Grammar(builder)
+            {
+                Name = "H145 Aviation Commands"
+            };
+        }
+
+        private void Recognizer_SpeechRecognized(
             object? sender,
-            SpeechRecognitionEventArgs e)
+            SpeechRecognizedEventArgs e)
         {
             if (e.Result == null)
                 return;
 
-            if (e.Result.Reason != ResultReason.RecognizedSpeech)
+            if (e.Result.Confidence < 0.55f)
                 return;
 
             string text = e.Result.Text?.Trim() ?? string.Empty;
@@ -112,7 +150,55 @@ namespace H145FlightPlanner.Speech
             if (string.IsNullOrWhiteSpace(text))
                 return;
 
+            // Normalize known aviation identifiers.
+            text = NormalizeAviationText(text);
+
             SpeechRecognized?.Invoke(this, text);
+        }
+
+        private void Recognizer_SpeechRecognitionRejected(
+            object? sender,
+            SpeechRecognitionRejectedEventArgs e)
+        {
+            // Ignore speech that Windows cannot recognize confidently.
+        }
+
+        private string NormalizeAviationText(string text)
+        {
+            text = text.Trim();
+
+            text = ReplaceIgnoreCase(
+                text,
+                "E G C K",
+                "EGCK");
+
+            text = ReplaceIgnoreCase(
+                text,
+                "E G F A",
+                "EGFA");
+
+            text = ReplaceIgnoreCase(
+                text,
+                "Echo Golf Charlie Kilo",
+                "EGCK");
+
+            text = ReplaceIgnoreCase(
+                text,
+                "Echo Golf Foxtrot Alpha",
+                "EGFA");
+
+            return text;
+        }
+
+        private string ReplaceIgnoreCase(
+            string source,
+            string oldValue,
+            string newValue)
+        {
+            return source.Replace(
+                oldValue,
+                newValue,
+                StringComparison.OrdinalIgnoreCase);
         }
     }
 }
