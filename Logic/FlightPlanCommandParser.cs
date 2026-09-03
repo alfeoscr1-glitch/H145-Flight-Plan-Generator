@@ -8,6 +8,28 @@ namespace H145FlightPlanner.Logic
 {
     public static class FlightPlanCommandParser
     {
+        private static readonly HashSet<string> ReservedWords =
+            new HashSet<string>(
+                new[]
+                {
+                    "BACK",
+                    "FROM",
+                    "THEN",
+                    "HEAD",
+                    "FLY",
+                    "OVER",
+                    "NEXT",
+                    "ONTO",
+                    "WITH",
+                    "MAKE",
+                    "TAKE",
+                    "LAND",
+                    "AREA",
+                    "CITY",
+                    "TOWN"
+                },
+                StringComparer.OrdinalIgnoreCase);
+
         public static FlightPlanRequest Parse(string input)
         {
             var request = new FlightPlanRequest();
@@ -29,6 +51,10 @@ namespace H145FlightPlanner.Logic
                 request.Departure =
                     icaoCodes[0];
             }
+
+            // -------------------------------------------------
+            // ORBIT
+            // -------------------------------------------------
 
             if (string.Equals(
                 request.RouteType,
@@ -64,6 +90,11 @@ namespace H145FlightPlanner.Logic
                 request.Destination =
                     ExtractContinueDestination(text);
             }
+
+            // -------------------------------------------------
+            // AROUND
+            // -------------------------------------------------
+
             else if (string.Equals(
                 request.RouteType,
                 "AROUND",
@@ -89,6 +120,11 @@ namespace H145FlightPlanner.Logic
                 request.Destination =
                     ExtractContinueDestination(text);
             }
+
+            // -------------------------------------------------
+            // DIRECT
+            // -------------------------------------------------
+
             else if (string.Equals(
                 request.RouteType,
                 "DIRECT",
@@ -100,6 +136,11 @@ namespace H145FlightPlanner.Logic
                         icaoCodes[1];
                 }
             }
+
+            // -------------------------------------------------
+            // OTHER ROUTE TYPES
+            // -------------------------------------------------
+
             else
             {
                 if (icaoCodes.Count > 1)
@@ -204,6 +245,8 @@ namespace H145FlightPlanner.Logic
             return matches
                 .Select(match =>
                     match.Value.ToUpperInvariant())
+                .Where(code =>
+                    !ReservedWords.Contains(code))
                 .ToList();
         }
 
@@ -260,7 +303,7 @@ namespace H145FlightPlanner.Logic
         {
             Match match = Regex.Match(
                 text,
-                @"\b(?:orbit|orbits|orbited|orbiting|circle|circles|circled|circling)\b\s*(?:around\s+|over\s+)?(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bcontinue\b|\bproceed\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))",
+                @"\b(?:orbit|orbits|orbited|orbiting|circle|circles|circled|circling)\b\s*(?:around\s+|over\s+)?(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bfly\s+back\b|\bcontinue\b|\bproceed\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))",
                 RegexOptions.IgnoreCase);
 
             if (match.Success)
@@ -277,7 +320,7 @@ namespace H145FlightPlanner.Logic
         {
             Match match = Regex.Match(
                 text,
-                @"\b(?:go\s+around|going\s+around|fly\s+around|flying\s+around|around|rounding|round)\b\s+(?:the\s+)?(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bcontinue\b|\bproceed\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))",
+                @"\b(?:go\s+around|going\s+around|fly\s+around|flying\s+around|around|rounding|round)\b\s+(?:the\s+)?(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bfly\s+back\b|\bcontinue\b|\bproceed\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))",
                 RegexOptions.IgnoreCase);
 
             if (!match.Success)
@@ -298,9 +341,15 @@ namespace H145FlightPlanner.Logic
             if (!match.Success)
                 return null;
 
-            return match.Groups["icao"]
-                .Value
-                .ToUpperInvariant();
+            string code =
+                match.Groups["icao"]
+                    .Value
+                    .ToUpperInvariant();
+
+            if (ReservedWords.Contains(code))
+                return null;
+
+            return code;
         }
 
         private static string ExtractReturnIcao(
@@ -308,15 +357,21 @@ namespace H145FlightPlanner.Logic
         {
             Match match = Regex.Match(
                 text,
-                @"\b(?:return(?:ing)?|go\s+back|head\s+back)\s+(?:to\s+)?(?<icao>[A-Z]{4})(?![A-Za-z0-9])",
+                @"\b(?:return(?:ing)?|go\s+back|head\s+back|fly\s+back)\s+(?:to\s+)?(?<icao>[A-Z]{4})(?![A-Za-z0-9])",
                 RegexOptions.IgnoreCase);
 
             if (!match.Success)
                 return string.Empty;
 
-            return match.Groups["icao"]
-                .Value
-                .ToUpperInvariant();
+            string code =
+                match.Groups["icao"]
+                    .Value
+                    .ToUpperInvariant();
+
+            if (ReservedWords.Contains(code))
+                return string.Empty;
+
+            return code;
         }
 
         private static string ExtractContinueDestination(
@@ -324,15 +379,29 @@ namespace H145FlightPlanner.Logic
         {
             Match match = Regex.Match(
                 text,
-                @"\b(?:continue|proceed|fly|head)\s+(?:on\s+)?(?:to\s+)?(?<icao>[A-Z]{4})(?![A-Za-z0-9])",
+                @"\b(?:continue|proceed)\s+(?:on\s+)?(?:to\s+)?(?<icao>[A-Z]{4})(?![A-Za-z0-9])",
                 RegexOptions.IgnoreCase);
+
+            if (!match.Success)
+            {
+                match = Regex.Match(
+                    text,
+                    @"\b(?:fly|head)\s+to\s+(?<icao>[A-Z]{4})(?![A-Za-z0-9])",
+                    RegexOptions.IgnoreCase);
+            }
 
             if (!match.Success)
                 return string.Empty;
 
-            return match.Groups["icao"]
-                .Value
-                .ToUpperInvariant();
+            string code =
+                match.Groups["icao"]
+                    .Value
+                    .ToUpperInvariant();
+
+            if (ReservedWords.Contains(code))
+                return string.Empty;
+
+            return code;
         }
 
         private static bool ContainsReturnInstruction(
@@ -340,7 +409,7 @@ namespace H145FlightPlanner.Logic
         {
             return Regex.IsMatch(
                 text,
-                @"\b(?:return|returning|go\s+back|head\s+back)\b",
+                @"\b(?:return|returning|go\s+back|head\s+back|fly\s+back)\b",
                 RegexOptions.IgnoreCase);
         }
 
