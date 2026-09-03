@@ -1,7 +1,12 @@
 using System;
 using System.Drawing;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using H145FlightPlanner.Logic;
+using H145FlightPlanner.Models;
+using H145FlightPlanner.Routing;
+using H145FlightPlanner.Services;
 using H145FlightPlanner.Speech;
 
 namespace H145FlightPlanner
@@ -19,6 +24,8 @@ namespace H145FlightPlanner
     public class MainForm : Form
     {
         private readonly WhisperSpeechService _whisperService;
+        private readonly AirportService _airportService;
+        private readonly DirectRouteGenerator _directRouteGenerator;
 
         private readonly TextBox _commandBox;
         private readonly Button _microphoneButton;
@@ -33,9 +40,16 @@ namespace H145FlightPlanner
 
         private bool _isListening;
 
+        private GeneratedFlightPlan? _currentFlightPlan;
+
         public MainForm()
         {
             _whisperService = new WhisperSpeechService();
+
+            _airportService = new AirportService();
+
+            _directRouteGenerator =
+                new DirectRouteGenerator(_airportService);
 
             _whisperService.TranscriptionReceived += OnTranscriptionReceived;
             _whisperService.StatusChanged += OnWhisperStatusChanged;
@@ -110,7 +124,8 @@ namespace H145FlightPlanner
                 Anchor = AnchorStyles.Top |
                          AnchorStyles.Left |
                          AnchorStyles.Right,
-                PlaceholderText = "Type your flight plan here, or use the microphone..."
+                PlaceholderText =
+                    "Type your flight plan here, or use the microphone..."
             };
 
             Button generateButton = new Button
@@ -210,10 +225,8 @@ namespace H145FlightPlanner
 
             routeGroup.Controls.Add(departureLabel);
             routeGroup.Controls.Add(_departureValue);
-
             routeGroup.Controls.Add(destinationLabel);
             routeGroup.Controls.Add(_destinationValue);
-
             routeGroup.Controls.Add(routeTypeLabel);
             routeGroup.Controls.Add(_routeTypeValue);
 
@@ -255,7 +268,8 @@ namespace H145FlightPlanner
                 Size = new Size(220, 38),
                 Enabled = false,
                 Font = new Font("Segoe UI", 10, FontStyle.Bold),
-                Anchor = AnchorStyles.Bottom | AnchorStyles.Left
+                Anchor = AnchorStyles.Bottom |
+                         AnchorStyles.Left
             };
 
             outputGroup.Controls.Add(_flightPlanBox);
@@ -304,6 +318,119 @@ namespace H145FlightPlanner
                 _isListening = true;
 
                 _microphoneButton.Text = "🛑 STOP SPEAKING";
+            }
+        }
+
+        private async void GenerateButton_Click(
+            object? sender,
+            EventArgs e)
+        {
+            try
+            {
+                string input = _commandBox.Text.Trim();
+
+                if (string.IsNullOrWhiteSpace(input))
+                {
+                    MessageBox.Show(
+                        "Please type or speak a flight-plan request first.",
+                        "No Flight Plan Request",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+
+                    return;
+                }
+
+                FlightPlanRequest request =
+                    FlightPlanCommandParser.Parse(input);
+
+                _departureValue.Text =
+                    string.IsNullOrWhiteSpace(request.Departure)
+                        ? "—"
+                        : request.Departure;
+
+                _destinationValue.Text =
+                    string.IsNullOrWhiteSpace(request.Destination)
+                        ? "—"
+                        : request.Destination;
+
+                _routeTypeValue.Text =
+                    string.IsNullOrWhiteSpace(request.RouteType)
+                        ? "—"
+                        : request.RouteType;
+
+                if (!string.Equals(
+                    request.RouteType,
+                    "DIRECT",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    _flightPlanBox.Text =
+                        "The request was understood, but this route type " +
+                        "has not been implemented yet.";
+
+                    _exportButton.Enabled = false;
+
+                    return;
+                }
+
+                _flightPlanBox.Text =
+                    "Looking up airports and generating route...";
+
+                _currentFlightPlan =
+                    await _directRouteGenerator.GenerateAsync(request);
+
+                var output = new StringBuilder();
+
+                output.AppendLine(
+                    $"Flight rules: {_currentFlightPlan.FlightRules}");
+
+                output.AppendLine(
+                    $"Cruising altitude: " +
+                    $"{_currentFlightPlan.CruisingAltitudeFeet} ft");
+
+                output.AppendLine();
+
+                output.AppendLine("Route:");
+
+                for (int i = 0;
+                     i < _currentFlightPlan.Waypoints.Count;
+                     i++)
+                {
+                    RouteWaypoint waypoint =
+                        _currentFlightPlan.Waypoints[i];
+
+                    output.AppendLine(
+                        $"{i + 1}. " +
+                        $"{waypoint.Ident} - " +
+                        $"{waypoint.Name}");
+
+                    output.AppendLine(
+                        $"   Lat: {waypoint.Latitude:F6}");
+
+                    output.AppendLine(
+                        $"   Lon: {waypoint.Longitude:F6}");
+
+                    output.AppendLine(
+                        $"   Alt: {waypoint.AltitudeFeet:F0} ft");
+                }
+
+                _flightPlanBox.Text = output.ToString();
+
+                _exportButton.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                _currentFlightPlan = null;
+
+                _exportButton.Enabled = false;
+
+                _flightPlanBox.Text =
+                    $"Flight plan could not be generated.\r\n\r\n{ex.Message}";
+
+                MessageBox.Show(
+                    ex.Message,
+                    "Flight Plan Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
             }
         }
 
@@ -367,7 +494,9 @@ namespace H145FlightPlanner
 
             _commandBox.AppendText(text.Trim());
 
-            _commandBox.SelectionStart = _commandBox.Text.Length;
+            _commandBox.SelectionStart =
+                _commandBox.Text.Length;
+
             _commandBox.ScrollToCaret();
         }
 
@@ -384,6 +513,7 @@ namespace H145FlightPlanner
             }
 
             _microphoneButton.Enabled = true;
+
             _microphoneStatus.Text = "Whisper error";
             _microphoneStatus.ForeColor = Color.DarkRed;
 
@@ -392,29 +522,6 @@ namespace H145FlightPlanner
                 "Whisper Error",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
-        }
-
-        private void GenerateButton_Click(
-            object? sender,
-            EventArgs e)
-        {
-            if (string.IsNullOrWhiteSpace(_commandBox.Text))
-            {
-                MessageBox.Show(
-                    "Please type or speak a flight-plan request first.",
-                    "No Flight Plan Request",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-
-                return;
-            }
-
-            MessageBox.Show(
-                "Whisper speech recognition is connected.\n\n" +
-                "Flight-plan generation will be added in a later stage.",
-                "Speech Test",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
         }
 
         private void MainForm_FormClosing(
