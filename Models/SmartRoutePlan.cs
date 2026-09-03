@@ -9,6 +9,9 @@ namespace H145FlightPlanner.Models
         public int? AltitudeFeet { get; set; }
         public string FlightRules { get; set; } = string.Empty;
         public string Summary { get; set; } = string.Empty;
+
+        // The local AI can return as many ordered steps as the instruction needs.
+        // There is intentionally no fixed maximum number of legs.
         public List<SmartRouteStep> Steps { get; set; } = new();
     }
 
@@ -23,6 +26,7 @@ namespace H145FlightPlanner.Models
         public string Direction { get; set; } = string.Empty;
         public bool KeepCloseToEdge { get; set; } = true;
         public bool CompleteLoop { get; set; }
+        public bool AvoidLand { get; set; } = true;
         public string Notes { get; set; } = string.Empty;
     }
 }
