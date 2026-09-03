@@ -1,11 +1,11 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -13,7 +13,8 @@ namespace H145FlightPlanner.Services
 {
     public class LocalAiModelManager
     {
-        private static readonly HttpClient HttpClient = CreateHttpClient();
+        private static readonly HttpClient HttpClient =
+            CreateHttpClient();
 
         private readonly string _root;
         private readonly string _runtimeFolder;
@@ -76,6 +77,9 @@ namespace H145FlightPlanner.Services
             client.DefaultRequestHeaders.UserAgent.ParseAdd(
                 "H145FlightPlanGenerator/1.0");
 
+            client.DefaultRequestHeaders.Accept.ParseAdd(
+                "application/vnd.github+json");
+
             return client;
         }
 
@@ -113,128 +117,12 @@ namespace H145FlightPlanner.Services
         private async Task<string> DownloadRuntimeAsync(
             CancellationToken cancellationToken)
         {
-            const string releasesUrl =
-                "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
-
-            using HttpResponseMessage response =
-                await HttpClient.GetAsync(
-                    releasesUrl,
+            List<(string Name, string Url)> candidates =
+                await FindRuntimeCandidatesAsync(
                     cancellationToken);
 
-            response.EnsureSuccessStatusCode();
-
-            string json =
-                await response.Content.ReadAsStringAsync(
-                    cancellationToken);
-
-            using JsonDocument document =
-                JsonDocument.Parse(json);
-
-            if (!document.RootElement.TryGetProperty(
-                    "assets",
-                    out JsonElement assets) ||
-                assets.ValueKind != JsonValueKind.Array)
-            {
-                throw new InvalidOperationException(
-                    "The local AI runtime release could not be discovered.");
-            }
-
-            var candidates =
-                new List<(string Name, string Url)>();
-
-            foreach (JsonElement asset
-                in assets.EnumerateArray())
-            {
-                string name =
-                    asset.TryGetProperty(
-                        "name",
-                        out JsonElement nameElement)
-                        ? nameElement.GetString()
-                          ?? string.Empty
-                        : string.Empty;
-
-                string url =
-                    asset.TryGetProperty(
-                        "browser_download_url",
-                        out JsonElement urlElement)
-                        ? urlElement.GetString()
-                          ?? string.Empty
-                        : string.Empty;
-
-                if (string.IsNullOrWhiteSpace(name) ||
-                    string.IsNullOrWhiteSpace(url))
-                {
-                    continue;
-                }
-
-                bool isZip =
-                    name.EndsWith(
-                        ".zip",
-                        StringComparison.OrdinalIgnoreCase);
-
-                bool isWindows =
-                    name.Contains(
-                        "win",
-                        StringComparison.OrdinalIgnoreCase);
-
-                bool isX64 =
-                    name.Contains(
-                        "x64",
-                        StringComparison.OrdinalIgnoreCase);
-
-                bool isLlamaBinary =
-                    name.Contains(
-                        "llama-",
-                        StringComparison.OrdinalIgnoreCase);
-
-                bool isCudaRuntimeOnly =
-                    name.StartsWith(
-                        "cudart-",
-                        StringComparison.OrdinalIgnoreCase);
-
-                if (isZip &&
-                    isWindows &&
-                    isX64 &&
-                    isLlamaBinary &&
-                    !isCudaRuntimeOnly)
-                {
-                    candidates.Add(
-                        (name, url));
-                }
-            }
-
-            // First preference:
-            // standard Windows x64 CPU build.
             (string Name, string Url) selected =
-                candidates.FirstOrDefault(x =>
-                    x.Name.Contains(
-                        "-bin-win-x64",
-                        StringComparison.OrdinalIgnoreCase));
-
-            // Second preference:
-            // any plain x64 Windows build that is not
-            // CUDA, Vulkan, SYCL, OpenVINO, HIP or ROCm.
-            if (string.IsNullOrWhiteSpace(
-                    selected.Url))
-            {
-                selected =
-                    candidates.FirstOrDefault(x =>
-                        !ContainsGpuBackend(
-                            x.Name));
-            }
-
-            // Last-resort fallback:
-            // Vulkan build. This is widely usable on
-            // modern Windows GPUs and still contains llama-cli.
-            if (string.IsNullOrWhiteSpace(
-                    selected.Url))
-            {
-                selected =
-                    candidates.FirstOrDefault(x =>
-                        x.Name.Contains(
-                            "vulkan",
-                            StringComparison.OrdinalIgnoreCase));
-            }
+                SelectBestRuntime(candidates);
 
             if (string.IsNullOrWhiteSpace(
                     selected.Url))
@@ -248,8 +136,7 @@ namespace H145FlightPlanner.Services
                                 x => x.Name));
 
                 throw new InvalidOperationException(
-                    "A Windows x64 local AI runtime could not be found " +
-                    "in the latest llama.cpp release." +
+                    "A Windows x64 local AI runtime could not be found." +
                     Environment.NewLine +
                     Environment.NewLine +
                     "Matching assets seen:" +
@@ -263,7 +150,9 @@ namespace H145FlightPlanner.Services
                     "llama-runtime.zip");
 
             if (File.Exists(zipPath))
+            {
                 File.Delete(zipPath);
+            }
 
             using (
                 HttpResponseMessage download =
@@ -316,6 +205,394 @@ namespace H145FlightPlanner.Services
             }
 
             return exe;
+        }
+
+        private async Task<
+            List<(string Name, string Url)>>
+            FindRuntimeCandidatesAsync(
+                CancellationToken cancellationToken)
+        {
+            // -------------------------------------------------
+            // llama.cpp changed the way its GitHub releases
+            // are presented.
+            //
+            // /releases/latest may now contain a small
+            // nightly-tag.txt pointer instead of the actual
+            // Windows binaries.
+            //
+            // First try to resolve that pointer to the real
+            // bXXXXX build release.
+            // -------------------------------------------------
+
+            const string latestReleaseUrl =
+                "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
+
+            JsonDocument latestDocument =
+                await DownloadJsonAsync(
+                    latestReleaseUrl,
+                    cancellationToken);
+
+            using (latestDocument)
+            {
+                List<(string Name, string Url)> directCandidates =
+                    ExtractWindowsRuntimeCandidates(
+                        latestDocument.RootElement);
+
+                // If GitHub changes back to putting binaries
+                // directly on "latest", this still works.
+                if (directCandidates.Count > 0)
+                {
+                    return directCandidates;
+                }
+
+                string nightlyTagUrl =
+                    FindAssetUrl(
+                        latestDocument.RootElement,
+                        "nightly-tag.txt");
+
+                if (!string.IsNullOrWhiteSpace(
+                        nightlyTagUrl))
+                {
+                    string nightlyTag =
+                        await DownloadTextAsync(
+                            nightlyTagUrl,
+                            cancellationToken);
+
+                    nightlyTag =
+                        nightlyTag.Trim();
+
+                    Match tagMatch =
+                        Regex.Match(
+                            nightlyTag,
+                            @"b\d+",
+                            RegexOptions.IgnoreCase);
+
+                    if (tagMatch.Success)
+                    {
+                        string buildTag =
+                            tagMatch.Value;
+
+                        List<(string Name, string Url)> tagCandidates =
+                            await GetCandidatesForTagAsync(
+                                buildTag,
+                                cancellationToken);
+
+                        if (tagCandidates.Count > 0)
+                        {
+                            return tagCandidates;
+                        }
+                    }
+                }
+            }
+
+            // -------------------------------------------------
+            // FALLBACK
+            //
+            // If nightly-tag.txt was unavailable, inspect recent
+            // releases and take the newest one that actually
+            // contains a Windows x64 llama.cpp runtime.
+            // -------------------------------------------------
+
+            for (int page = 1;
+                 page <= 5;
+                 page++)
+            {
+                string releasesUrl =
+                    "https://api.github.com/repos/ggml-org/llama.cpp/releases" +
+                    $"?per_page=20&page={page}";
+
+                JsonDocument releasesDocument =
+                    await DownloadJsonAsync(
+                        releasesUrl,
+                        cancellationToken);
+
+                using (releasesDocument)
+                {
+                    if (releasesDocument.RootElement.ValueKind !=
+                        JsonValueKind.Array)
+                    {
+                        continue;
+                    }
+
+                    foreach (
+                        JsonElement release
+                        in releasesDocument.RootElement.EnumerateArray())
+                    {
+                        List<(string Name, string Url)> candidates =
+                            ExtractWindowsRuntimeCandidates(
+                                release);
+
+                        if (candidates.Count > 0)
+                        {
+                            return candidates;
+                        }
+                    }
+                }
+            }
+
+            return new List<(string Name, string Url)>();
+        }
+
+        private async Task<
+            List<(string Name, string Url)>>
+            GetCandidatesForTagAsync(
+                string tag,
+                CancellationToken cancellationToken)
+        {
+            string encodedTag =
+                Uri.EscapeDataString(
+                    tag);
+
+            string releaseUrl =
+                "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/" +
+                encodedTag;
+
+            try
+            {
+                JsonDocument document =
+                    await DownloadJsonAsync(
+                        releaseUrl,
+                        cancellationToken);
+
+                using (document)
+                {
+                    return ExtractWindowsRuntimeCandidates(
+                        document.RootElement);
+                }
+            }
+            catch (HttpRequestException)
+            {
+                return new List<(string Name, string Url)>();
+            }
+        }
+
+        private static List<(string Name, string Url)>
+            ExtractWindowsRuntimeCandidates(
+                JsonElement release)
+        {
+            var candidates =
+                new List<(string Name, string Url)>();
+
+            if (!release.TryGetProperty(
+                    "assets",
+                    out JsonElement assets) ||
+                assets.ValueKind != JsonValueKind.Array)
+            {
+                return candidates;
+            }
+
+            foreach (
+                JsonElement asset
+                in assets.EnumerateArray())
+            {
+                string name =
+                    asset.TryGetProperty(
+                        "name",
+                        out JsonElement nameElement)
+                        ? nameElement.GetString()
+                          ?? string.Empty
+                        : string.Empty;
+
+                string url =
+                    asset.TryGetProperty(
+                        "browser_download_url",
+                        out JsonElement urlElement)
+                        ? urlElement.GetString()
+                          ?? string.Empty
+                        : string.Empty;
+
+                if (string.IsNullOrWhiteSpace(name) ||
+                    string.IsNullOrWhiteSpace(url))
+                {
+                    continue;
+                }
+
+                bool isZip =
+                    name.EndsWith(
+                        ".zip",
+                        StringComparison.OrdinalIgnoreCase);
+
+                bool isWindows =
+                    name.Contains(
+                        "win",
+                        StringComparison.OrdinalIgnoreCase);
+
+                bool isX64 =
+                    name.Contains(
+                        "x64",
+                        StringComparison.OrdinalIgnoreCase);
+
+                bool isLlama =
+                    name.Contains(
+                        "llama",
+                        StringComparison.OrdinalIgnoreCase);
+
+                bool isRuntimeOnly =
+                    name.StartsWith(
+                        "cudart-",
+                        StringComparison.OrdinalIgnoreCase);
+
+                if (isZip &&
+                    isWindows &&
+                    isX64 &&
+                    isLlama &&
+                    !isRuntimeOnly)
+                {
+                    candidates.Add(
+                        (name, url));
+                }
+            }
+
+            return candidates;
+        }
+
+        private static (
+            string Name,
+            string Url)
+            SelectBestRuntime(
+                List<(string Name, string Url)> candidates)
+        {
+            // -------------------------------------------------
+            // FIRST CHOICE:
+            // CPU x64 build.
+            //
+            // This avoids requiring CUDA/Vulkan/etc. and should
+            // run on a normal Windows x64 machine.
+            // -------------------------------------------------
+
+            (string Name, string Url) selected =
+                candidates.FirstOrDefault(
+                    x =>
+                        x.Name.Contains(
+                            "cpu",
+                            StringComparison.OrdinalIgnoreCase) &&
+                        !ContainsGpuBackend(
+                            x.Name));
+
+            // -------------------------------------------------
+            // SECOND CHOICE:
+            // Generic Windows x64 build with no GPU backend
+            // explicitly attached to the package name.
+            // -------------------------------------------------
+
+            if (string.IsNullOrWhiteSpace(
+                    selected.Url))
+            {
+                selected =
+                    candidates.FirstOrDefault(
+                        x =>
+                            !ContainsGpuBackend(
+                                x.Name));
+            }
+
+            // -------------------------------------------------
+            // THIRD CHOICE:
+            // Vulkan.
+            // -------------------------------------------------
+
+            if (string.IsNullOrWhiteSpace(
+                    selected.Url))
+            {
+                selected =
+                    candidates.FirstOrDefault(
+                        x =>
+                            x.Name.Contains(
+                                "vulkan",
+                                StringComparison.OrdinalIgnoreCase));
+            }
+
+            // -------------------------------------------------
+            // LAST RESORT:
+            // Any Windows x64 llama binary archive.
+            // -------------------------------------------------
+
+            if (string.IsNullOrWhiteSpace(
+                    selected.Url))
+            {
+                selected =
+                    candidates.FirstOrDefault();
+            }
+
+            return selected;
+        }
+
+        private static string FindAssetUrl(
+            JsonElement release,
+            string assetName)
+        {
+            if (!release.TryGetProperty(
+                    "assets",
+                    out JsonElement assets) ||
+                assets.ValueKind != JsonValueKind.Array)
+            {
+                return string.Empty;
+            }
+
+            foreach (
+                JsonElement asset
+                in assets.EnumerateArray())
+            {
+                string name =
+                    asset.TryGetProperty(
+                        "name",
+                        out JsonElement nameElement)
+                        ? nameElement.GetString()
+                          ?? string.Empty
+                        : string.Empty;
+
+                if (!string.Equals(
+                        name,
+                        assetName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                return asset.TryGetProperty(
+                    "browser_download_url",
+                    out JsonElement urlElement)
+                        ? urlElement.GetString()
+                          ?? string.Empty
+                        : string.Empty;
+            }
+
+            return string.Empty;
+        }
+
+        private static async Task<JsonDocument>
+            DownloadJsonAsync(
+                string url,
+                CancellationToken cancellationToken)
+        {
+            using HttpResponseMessage response =
+                await HttpClient.GetAsync(
+                    url,
+                    cancellationToken);
+
+            response.EnsureSuccessStatusCode();
+
+            string json =
+                await response.Content.ReadAsStringAsync(
+                    cancellationToken);
+
+            return JsonDocument.Parse(
+                json);
+        }
+
+        private static async Task<string>
+            DownloadTextAsync(
+                string url,
+                CancellationToken cancellationToken)
+        {
+            using HttpResponseMessage response =
+                await HttpClient.GetAsync(
+                    url,
+                    cancellationToken);
+
+            response.EnsureSuccessStatusCode();
+
+            return await response.Content.ReadAsStringAsync(
+                cancellationToken);
         }
 
         private static bool ContainsGpuBackend(
@@ -380,7 +657,9 @@ namespace H145FlightPlanner.Services
                         ".download";
 
                     if (File.Exists(tempPath))
+                    {
                         File.Delete(tempPath);
+                    }
 
                     await using Stream source =
                         await response.Content.ReadAsStreamAsync(
