@@ -12,8 +12,6 @@ namespace H145FlightPlanner.Models
 
         public string OrbitLocation { get; set; } = string.Empty;
 
-        public string AroundLocation { get; set; } = string.Empty;
-
         public string ReturnLocation { get; set; } = string.Empty;
 
         public int? AltitudeFeet { get; set; }
