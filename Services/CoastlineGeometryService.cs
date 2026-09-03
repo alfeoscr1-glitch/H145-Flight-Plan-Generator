@@ -11,9 +11,14 @@ using H145FlightPlanner.Models;
 
 namespace H145FlightPlanner.Services
 {
-    // This service treats "coastline" as the visible outer land/sea edge.
-    // It does not use administrative borders. It downloads detailed OSM edge
-    // vectors inside a route-sized view, builds a graph, and traces the edge.
+    // High-detail vector coastline tracer.
+    //
+    // Important design choice: this does NOT use screenshots, Google imagery or
+    // administrative borders. Screenshots would be less precise and Google/Bing
+    // imagery cannot be silently scraped or redistributed. Instead the service
+    // uses the actual OSM land/sea edge vectors, fetches them in overlapping
+    // route-sized tiles, joins small data gaps, measures every segment and keeps
+    // hundreds/thousands of points when needed.
     public class CoastlineGeometryService
     {
         private static readonly HttpClient HttpClient = CreateHttpClient();
@@ -28,9 +33,8 @@ namespace H145FlightPlanner.Services
         private static HttpClient CreateHttpClient()
         {
             var client = new HttpClient();
-            client.DefaultRequestHeaders.UserAgent.ParseAdd(
-                "H145FlightPlanGenerator/1.0");
-            client.Timeout = TimeSpan.FromSeconds(60);
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("H145FlightPlanGenerator/2.0");
+            client.Timeout = TimeSpan.FromSeconds(75);
             return client;
         }
 
@@ -41,11 +45,7 @@ namespace H145FlightPlanner.Services
             if (area == null)
                 throw new ArgumentNullException(nameof(area));
 
-            double south;
-            double north;
-            double west;
-            double east;
-
+            double south, north, west, east;
             if (area.HasBoundingBox)
             {
                 south = area.SouthLatitude;
@@ -55,54 +55,49 @@ namespace H145FlightPlanner.Services
             }
             else
             {
-                const double fallback = 0.35;
+                const double fallback = 0.30;
                 south = area.Latitude - fallback;
                 north = area.Latitude + fallback;
                 west = area.Longitude - fallback;
                 east = area.Longitude + fallback;
             }
 
-            ExpandBoundingBox(ref south, ref north, ref west, ref east, 0.35, 0.08);
+            ExpandBox(ref south, ref north, ref west, ref east, 0.40, 0.08);
 
-            LandEdgeGraph graph = await DownloadGraphAsync(
+            LandEdgeGraph graph = await DownloadTiledGraphAsync(
                 south, north, west, east, cancellationToken);
 
-            List<int> component =
-                graph.GetComponentNearest(area.Latitude, area.Longitude);
+            graph.SnapNearbyEnds(0.10);
 
+            List<int> component = graph.GetComponentNearest(area.Latitude, area.Longitude);
             if (component.Count < 3)
+                throw new InvalidOperationException($"No detailed outer edge was found around {area.Name}.");
+
+            List<GraphStep> loop = graph.TryBuildClosedLoop(component, area.Latitude, area.Longitude);
+
+            if (loop.Count < 4)
+            {
+                // One more conservative repair pass for tiny OSM endpoint gaps.
+                graph.SnapNearbyEnds(0.22);
+                component = graph.GetComponentNearest(area.Latitude, area.Longitude);
+                loop = graph.TryBuildClosedLoop(component, area.Latitude, area.Longitude);
+            }
+
+            if (loop.Count < 4)
             {
                 throw new InvalidOperationException(
-                    $"A detailed outer land edge could not be traced around {area.Name}.");
+                    $"The real outer edge around {area.Name} was found, but it did not form a complete circuit. " +
+                    "The program refused to invent an oval or a fake closing line.");
             }
 
-            List<CoastlinePoint> ordered =
-                graph.TryBuildClosedLoop(component, area.Latitude, area.Longitude);
-
-            bool closed = ordered.Count >= 4 &&
-                          DistanceNm(ordered[0], ordered[^1]) < 0.02;
-
-            if (!closed)
-            {
-                // Regions such as counties can have only a section of sea-facing
-                // edge inside their bounds. In that case trace the longest detailed
-                // edge section rather than inventing an oval or admin-border loop.
-                ordered = graph.BuildLongestDetailedPath(component);
-            }
-
-            if (ordered.Count < 2)
-            {
-                throw new InvalidOperationException(
-                    $"No usable detailed outer edge was found for {area.Name}.");
-            }
-
-            ordered = Densify(ordered, 0.12, 3000, closed);
+            List<CoastlinePoint> points = graph.ToOffshorePoints(loop, 0.08);
+            points = Densify(points, 0.08, 5000, true);
 
             return new CoastlineGeometry
             {
-                Points = ordered,
-                IsClosed = closed,
-                SourceDescription = "OpenStreetMap detailed land/sea edge"
+                Points = points,
+                IsClosed = true,
+                SourceDescription = "OSM tiled detailed land/sea edge"
             };
         }
 
@@ -111,16 +106,9 @@ namespace H145FlightPlanner.Services
             AirportResult destination,
             CancellationToken cancellationToken = default)
         {
-            if (departure == null)
-                throw new ArgumentNullException(nameof(departure));
-            if (destination == null)
-                throw new ArgumentNullException(nameof(destination));
-
             return GetAlongCoastlineAsync(
-                departure.Latitude,
-                departure.Longitude,
-                destination.Latitude,
-                destination.Longitude,
+                departure.Latitude, departure.Longitude,
+                destination.Latitude, destination.Longitude,
                 cancellationToken);
         }
 
@@ -133,41 +121,49 @@ namespace H145FlightPlanner.Services
         {
             Exception? lastError = null;
 
-            // Increasing view sizes emulate zooming out until the full requested
-            // coastal route is visible and connected, without using screenshots.
-            double[] expansionFactors = { 0.20, 0.45, 0.85 };
+            // Progressive view sizes: equivalent to zooming out until the entire
+            // requested journey and its connected coast are visible.
+            double[] expansions = { 0.18, 0.35, 0.60, 0.95 };
 
-            foreach (double factor in expansionFactors)
+            foreach (double expansion in expansions)
             {
                 double south = Math.Min(startLatitude, endLatitude);
                 double north = Math.Max(startLatitude, endLatitude);
                 double west = Math.Min(startLongitude, endLongitude);
                 double east = Math.Max(startLongitude, endLongitude);
-
-                ExpandBoundingBox(
-                    ref south, ref north, ref west, ref east, factor, 0.12);
+                ExpandBox(ref south, ref north, ref west, ref east, expansion, 0.12);
 
                 try
                 {
-                    LandEdgeGraph graph = await DownloadGraphAsync(
+                    LandEdgeGraph graph = await DownloadTiledGraphAsync(
                         south, north, west, east, cancellationToken);
 
-                    List<CoastlinePoint> route =
-                        graph.FindBestConnectedPath(
-                            startLatitude,
-                            startLongitude,
-                            endLatitude,
-                            endLongitude);
+                    // First join only genuine tiny data gaps. Then, if necessary,
+                    // allow slightly larger joins but penalise them heavily so real
+                    // coastline is always preferred.
+                    graph.SnapNearbyEnds(0.10);
+                    List<GraphStep> route = graph.FindBestCoastalPath(
+                        startLatitude, startLongitude,
+                        endLatitude, endLongitude);
+
+                    if (route.Count < 2)
+                    {
+                        graph.SnapNearbyEnds(0.30);
+                        route = graph.FindBestCoastalPath(
+                            startLatitude, startLongitude,
+                            endLatitude, endLongitude);
+                    }
 
                     if (route.Count >= 2)
                     {
-                        route = Densify(route, 0.12, 3000, false);
+                        List<CoastlinePoint> points = graph.ToOffshorePoints(route, 0.08);
+                        points = Densify(points, 0.08, 5000, false);
 
                         return new CoastlineGeometry
                         {
-                            Points = route,
+                            Points = points,
                             IsClosed = false,
-                            SourceDescription = "OpenStreetMap detailed land/sea edge"
+                            SourceDescription = "OSM tiled detailed land/sea edge"
                         };
                     }
                 }
@@ -178,11 +174,60 @@ namespace H145FlightPlanner.Services
             }
 
             throw new InvalidOperationException(
-                "A continuous detailed outer land edge could not be traced between the requested locations.",
+                "The map edge was downloaded, but a continuous coast-following path could not be constructed between these two requested points. " +
+                "No fake straight coastline was inserted.",
                 lastError);
         }
 
-        private static async Task<LandEdgeGraph> DownloadGraphAsync(
+        private static async Task<LandEdgeGraph> DownloadTiledGraphAsync(
+            double south,
+            double north,
+            double west,
+            double east,
+            CancellationToken cancellationToken)
+        {
+            // Split large requests into overlapping tiles. This avoids asking one
+            // Overpass server for a giant Wales-sized response and prevents a
+            // single clipped query from losing connectivity.
+            double latSpan = Math.Max(0.01, north - south);
+            double lonSpan = Math.Max(0.01, east - west);
+            int latTiles = Math.Clamp((int)Math.Ceiling(latSpan / 0.55), 1, 8);
+            int lonTiles = Math.Clamp((int)Math.Ceiling(lonSpan / 0.70), 1, 8);
+
+            var graph = new LandEdgeGraph();
+            var seenWays = new HashSet<long>();
+
+            for (int y = 0; y < latTiles; y++)
+            {
+                double tileSouth = south + latSpan * y / latTiles;
+                double tileNorth = south + latSpan * (y + 1) / latTiles;
+
+                for (int x = 0; x < lonTiles; x++)
+                {
+                    double tileWest = west + lonSpan * x / lonTiles;
+                    double tileEast = west + lonSpan * (x + 1) / lonTiles;
+
+                    double latPad = Math.Max(0.02, (tileNorth - tileSouth) * 0.10);
+                    double lonPad = Math.Max(0.02, (tileEast - tileWest) * 0.10);
+
+                    string json = await DownloadTileAsync(
+                        tileSouth - latPad,
+                        tileNorth + latPad,
+                        tileWest - lonPad,
+                        tileEast + lonPad,
+                        cancellationToken);
+
+                    AddTileToGraph(json, graph, seenWays);
+                }
+            }
+
+            if (graph.VertexCount < 2)
+                throw new InvalidOperationException("No detailed OSM land/sea edge vectors were returned for this route area.");
+
+            return graph;
+        }
+
+        private static async Task<string> DownloadTileAsync(
             double south,
             double north,
             double west,
@@ -197,7 +242,7 @@ namespace H145FlightPlanner.Services
                 $"""
                 [out:json][timeout:45];
                 way["natural"="coastline"]({bbox});
-                out geom;
+                out ids geom;
                 """;
 
             var errors = new List<string>();
@@ -219,13 +264,7 @@ namespace H145FlightPlanner.Services
                     }
 
                     response.EnsureSuccessStatusCode();
-
-                    string json =
-                        await response.Content.ReadAsStringAsync(cancellationToken);
-
-                    LandEdgeGraph graph = ParseGraph(json);
-                    if (graph.VertexCount > 1)
-                        return graph;
+                    return await response.Content.ReadAsStringAsync(cancellationToken);
                 }
                 catch (Exception ex) when (ex is HttpRequestException or JsonException)
                 {
@@ -234,53 +273,46 @@ namespace H145FlightPlanner.Services
             }
 
             throw new InvalidOperationException(
-                "Detailed map-edge data could not be downloaded." +
-                (errors.Count == 0 ? string.Empty : "\r\n" + string.Join("\r\n", errors)));
+                "A coastline map tile could not be downloaded. " + string.Join(" | ", errors));
         }
 
-        private static LandEdgeGraph ParseGraph(string json)
+        private static void AddTileToGraph(
+            string json,
+            LandEdgeGraph graph,
+            HashSet<long> seenWays)
         {
             using JsonDocument document = JsonDocument.Parse(json);
-            var graph = new LandEdgeGraph();
-
             if (!document.RootElement.TryGetProperty("elements", out JsonElement elements) ||
                 elements.ValueKind != JsonValueKind.Array)
-            {
-                return graph;
-            }
+                return;
 
             foreach (JsonElement element in elements.EnumerateArray())
             {
+                long wayId = element.TryGetProperty("id", out JsonElement idElement) &&
+                             idElement.TryGetInt64(out long id) ? id : 0;
+
+                if (wayId != 0 && !seenWays.Add(wayId))
+                    continue;
+
                 if (!element.TryGetProperty("geometry", out JsonElement geometry) ||
                     geometry.ValueKind != JsonValueKind.Array)
-                {
                     continue;
-                }
 
-                CoastlinePoint? previous = null;
-
-                foreach (JsonElement point in geometry.EnumerateArray())
+                var points = new List<CoastlinePoint>();
+                foreach (JsonElement p in geometry.EnumerateArray())
                 {
-                    if (!point.TryGetProperty("lat", out JsonElement lat) ||
-                        !point.TryGetProperty("lon", out JsonElement lon))
+                    if (p.TryGetProperty("lat", out JsonElement lat) &&
+                        p.TryGetProperty("lon", out JsonElement lon) &&
+                        lat.TryGetDouble(out double la) && lon.TryGetDouble(out double lo))
                     {
-                        continue;
+                        points.Add(new CoastlinePoint { Latitude = la, Longitude = lo });
                     }
-
-                    var current = new CoastlinePoint
-                    {
-                        Latitude = lat.GetDouble(),
-                        Longitude = lon.GetDouble()
-                    };
-
-                    if (previous != null)
-                        graph.AddEdge(previous, current);
-
-                    previous = current;
                 }
-            }
 
-            return graph;
+                // OSM coastline direction convention: land is left, sea is right.
+                for (int i = 1; i < points.Count; i++)
+                    graph.AddCoastSegment(points[i - 1], points[i]);
+            }
         }
 
         private static List<CoastlinePoint> Densify(
@@ -292,27 +324,20 @@ namespace H145FlightPlanner.Services
             if (points.Count < 2)
                 return points;
 
-            var result = new List<CoastlinePoint>();
+            var output = new List<CoastlinePoint> { Clone(points[0]) };
+            int end = points.Count;
 
-            int segmentCount = closed ? points.Count : points.Count - 1;
-            if (closed && DistanceNm(points[0], points[^1]) < 0.02)
-                segmentCount = points.Count - 1;
-
-            for (int i = 0; i < segmentCount; i++)
+            for (int i = 1; i < end; i++)
             {
-                CoastlinePoint a = points[i];
-                CoastlinePoint b = points[(i + 1) % points.Count];
-
-                if (result.Count == 0)
-                    result.Add(Clone(a));
-
+                CoastlinePoint a = points[i - 1];
+                CoastlinePoint b = points[i];
                 double distance = DistanceNm(a, b);
-                int sections = Math.Max(1, (int)Math.Ceiling(distance / maxSegmentNm));
+                int pieces = Math.Max(1, (int)Math.Ceiling(distance / maxSegmentNm));
 
-                for (int s = 1; s <= sections; s++)
+                for (int p = 1; p <= pieces; p++)
                 {
-                    double f = s / (double)sections;
-                    result.Add(new CoastlinePoint
+                    double f = p / (double)pieces;
+                    output.Add(new CoastlinePoint
                     {
                         Latitude = a.Latitude + (b.Latitude - a.Latitude) * f,
                         Longitude = a.Longitude + (b.Longitude - a.Longitude) * f
@@ -320,49 +345,35 @@ namespace H145FlightPlanner.Services
                 }
             }
 
-            if (closed && DistanceNm(result[0], result[^1]) >= 0.02)
-                result.Add(Clone(result[0]));
+            if (closed && output.Count > 2 && DistanceNm(output[0], output[^1]) > 0.01)
+                output.Add(Clone(output[0]));
 
-            if (result.Count <= maxPoints)
-                return result;
+            if (output.Count <= maxPoints)
+                return output;
 
-            // Keep the complete shape while reducing uniformly only when Little
-            // Navmap would otherwise receive an extreme number of points.
-            double ratio = result.Count / (double)maxPoints;
-            var reduced = new List<CoastlinePoint>(maxPoints + 1);
-
-            for (int i = 0; i < maxPoints; i++)
-            {
-                int index = Math.Min(result.Count - 1, (int)Math.Floor(i * ratio));
-                reduced.Add(Clone(result[index]));
-            }
-
-            if (!closed)
-                reduced[^1] = Clone(result[^1]);
-            else if (DistanceNm(reduced[0], reduced[^1]) >= 0.02)
+            int stride = (int)Math.Ceiling(output.Count / (double)maxPoints);
+            List<CoastlinePoint> reduced = output.Where((_, i) => i % stride == 0).ToList();
+            if (!closed && DistanceNm(reduced[^1], output[^1]) > 0.001)
+                reduced.Add(Clone(output[^1]));
+            if (closed && DistanceNm(reduced[0], reduced[^1]) > 0.01)
                 reduced.Add(Clone(reduced[0]));
-
             return reduced;
         }
 
-        private static CoastlinePoint Clone(CoastlinePoint p) =>
-            new CoastlinePoint { Latitude = p.Latitude, Longitude = p.Longitude };
-
-        private static void ExpandBoundingBox(
+        private static void ExpandBox(
             ref double south,
             ref double north,
             ref double west,
             ref double east,
             double factor,
-            double minimumDegrees)
+            double minimum)
         {
-            double latSpan = Math.Max(minimumDegrees, north - south);
-            double lonSpan = Math.Max(minimumDegrees, east - west);
-
-            south -= latSpan * factor + minimumDegrees;
-            north += latSpan * factor + minimumDegrees;
-            west -= lonSpan * factor + minimumDegrees;
-            east += lonSpan * factor + minimumDegrees;
+            double lat = Math.Max(minimum, north - south);
+            double lon = Math.Max(minimum, east - west);
+            south -= lat * factor;
+            north += lat * factor;
+            west -= lon * factor;
+            east += lon * factor;
         }
 
         private static bool IsTemporaryFailure(HttpStatusCode statusCode) =>
@@ -372,46 +383,106 @@ namespace H145FlightPlanner.Services
             statusCode == HttpStatusCode.ServiceUnavailable ||
             statusCode == HttpStatusCode.GatewayTimeout;
 
+        private static CoastlinePoint Clone(CoastlinePoint p) =>
+            new CoastlinePoint { Latitude = p.Latitude, Longitude = p.Longitude };
+
         private static double DistanceNm(CoastlinePoint a, CoastlinePoint b) =>
             DistanceNm(a.Latitude, a.Longitude, b.Latitude, b.Longitude);
 
-        private static double DistanceNm(
-            double latitude1,
-            double longitude1,
-            double latitude2,
-            double longitude2)
+        private static double DistanceNm(double lat1, double lon1, double lat2, double lon2)
         {
-            const double earthRadiusNm = 3440.065;
-            double lat1 = latitude1 * Math.PI / 180.0;
-            double lat2 = latitude2 * Math.PI / 180.0;
-            double dLat = (latitude2 - latitude1) * Math.PI / 180.0;
-            double dLon = (longitude2 - longitude1) * Math.PI / 180.0;
+            const double radius = 3440.065;
+            double p1 = lat1 * Math.PI / 180.0;
+            double p2 = lat2 * Math.PI / 180.0;
+            double dp = (lat2 - lat1) * Math.PI / 180.0;
+            double dl = (lon2 - lon1) * Math.PI / 180.0;
+            double a = Math.Sin(dp / 2) * Math.Sin(dp / 2) +
+                       Math.Cos(p1) * Math.Cos(p2) *
+                       Math.Sin(dl / 2) * Math.Sin(dl / 2);
+            return radius * 2.0 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1.0 - a));
+        }
 
-            double a = Math.Sin(dLat / 2) * Math.Sin(dLat / 2) +
-                       Math.Cos(lat1) * Math.Cos(lat2) *
-                       Math.Sin(dLon / 2) * Math.Sin(dLon / 2);
+        private static double Bearing(double lat1, double lon1, double lat2, double lon2)
+        {
+            double p1 = lat1 * Math.PI / 180.0;
+            double p2 = lat2 * Math.PI / 180.0;
+            double dl = (lon2 - lon1) * Math.PI / 180.0;
+            double y = Math.Sin(dl) * Math.Cos(p2);
+            double x = Math.Cos(p1) * Math.Sin(p2) - Math.Sin(p1) * Math.Cos(p2) * Math.Cos(dl);
+            double value = Math.Atan2(y, x) * 180.0 / Math.PI;
+            return (value + 360.0) % 360.0;
+        }
 
-            return earthRadiusNm * 2.0 *
-                   Math.Atan2(Math.Sqrt(a), Math.Sqrt(1.0 - a));
+        private static CoastlinePoint Destination(CoastlinePoint start, double bearingDeg, double distanceNm)
+        {
+            const double radius = 3440.065;
+            double angular = distanceNm / radius;
+            double brg = bearingDeg * Math.PI / 180.0;
+            double p1 = start.Latitude * Math.PI / 180.0;
+            double l1 = start.Longitude * Math.PI / 180.0;
+            double p2 = Math.Asin(Math.Sin(p1) * Math.Cos(angular) + Math.Cos(p1) * Math.Sin(angular) * Math.Cos(brg));
+            double l2 = l1 + Math.Atan2(Math.Sin(brg) * Math.Sin(angular) * Math.Cos(p1), Math.Cos(angular) - Math.Sin(p1) * Math.Sin(p2));
+            return new CoastlinePoint { Latitude = p2 * 180.0 / Math.PI, Longitude = l2 * 180.0 / Math.PI };
         }
 
         private sealed class LandEdgeGraph
         {
             private readonly List<Vertex> _vertices = new();
-            private readonly Dictionary<string, int> _vertexByKey = new();
-
+            private readonly Dictionary<string, int> _byKey = new();
             public int VertexCount => _vertices.Count;
 
-            public void AddEdge(CoastlinePoint a, CoastlinePoint b)
+            public void AddCoastSegment(CoastlinePoint a, CoastlinePoint b)
             {
                 int ia = GetOrAdd(a);
                 int ib = GetOrAdd(b);
                 if (ia == ib)
                     return;
 
-                double weight = DistanceNm(a, b);
-                AddNeighbour(ia, ib, weight);
-                AddNeighbour(ib, ia, weight);
+                double length = DistanceNm(a, b);
+                double seaBearing = (Bearing(a.Latitude, a.Longitude, b.Latitude, b.Longitude) + 90.0) % 360.0;
+                AddEdge(ia, ib, length, seaBearing, false);
+                AddEdge(ib, ia, length, seaBearing, false);
+            }
+
+            public void SnapNearbyEnds(double maxGapNm)
+            {
+                List<int> ends = Enumerable.Range(0, _vertices.Count)
+                    .Where(i => RealDegree(i) <= 1)
+                    .ToList();
+
+                for (int i = 0; i < ends.Count; i++)
+                {
+                    int a = ends[i];
+                    if (RealDegree(a) > 1)
+                        continue;
+
+                    int best = -1;
+                    double bestDistance = maxGapNm;
+
+                    for (int j = i + 1; j < ends.Count; j++)
+                    {
+                        int b = ends[j];
+                        if (a == b || AreConnected(a, b))
+                            continue;
+
+                        double d = DistanceNm(_vertices[a].Point, _vertices[b].Point);
+                        if (d < bestDistance)
+                        {
+                            bestDistance = d;
+                            best = b;
+                        }
+                    }
+
+                    if (best >= 0)
+                    {
+                        // Bridge is marked and heavily penalised in pathfinding.
+                        double seaBearing = Bearing(
+                            _vertices[a].Point.Latitude, _vertices[a].Point.Longitude,
+                            _vertices[best].Point.Latitude, _vertices[best].Point.Longitude);
+                        AddEdge(a, best, bestDistance, seaBearing, true);
+                        AddEdge(best, a, bestDistance, seaBearing, true);
+                    }
+                }
             }
 
             public List<int> GetComponentNearest(double latitude, double longitude)
@@ -420,200 +491,203 @@ namespace H145FlightPlanner.Services
                 if (start < 0)
                     return new List<int>();
 
-                var result = new List<int>();
+                var output = new List<int>();
                 var queue = new Queue<int>();
-                var visited = new HashSet<int>();
-
+                var seen = new HashSet<int> { start };
                 queue.Enqueue(start);
-                visited.Add(start);
 
                 while (queue.Count > 0)
                 {
                     int current = queue.Dequeue();
-                    result.Add(current);
-
+                    output.Add(current);
                     foreach (Edge edge in _vertices[current].Edges)
                     {
-                        if (visited.Add(edge.To))
+                        if (seen.Add(edge.To))
                             queue.Enqueue(edge.To);
                     }
                 }
 
-                return result;
+                return output;
             }
 
-            public List<CoastlinePoint> FindBestConnectedPath(
+            public List<GraphStep> FindBestCoastalPath(
                 double startLatitude,
                 double startLongitude,
                 double endLatitude,
                 double endLongitude)
             {
-                int[] starts = FindNearestVertices(startLatitude, startLongitude, 24);
-                int[] ends = FindNearestVertices(endLatitude, endLongitude, 24);
+                int[] starts = FindNearestVertices(startLatitude, startLongitude, 36);
+                int[] ends = FindNearestVertices(endLatitude, endLongitude, 36);
 
                 double bestScore = double.MaxValue;
-                List<int>? bestPath = null;
+                List<GraphStep> best = new();
 
                 foreach (int start in starts)
                 {
-                    (double[] dist, int[] previous) = Dijkstra(start);
+                    (double[] distance, int[] previous, Edge?[] via) = Dijkstra(start);
 
                     foreach (int end in ends)
                     {
-                        if (double.IsInfinity(dist[end]))
+                        if (double.IsInfinity(distance[end]))
                             continue;
 
                         double joinStart = DistanceNm(
                             startLatitude, startLongitude,
-                            _vertices[start].Point.Latitude,
-                            _vertices[start].Point.Longitude);
-
+                            _vertices[start].Point.Latitude, _vertices[start].Point.Longitude);
                         double joinEnd = DistanceNm(
                             endLatitude, endLongitude,
-                            _vertices[end].Point.Latitude,
-                            _vertices[end].Point.Longitude);
+                            _vertices[end].Point.Latitude, _vertices[end].Point.Longitude);
 
-                        double score = joinStart + dist[end] + joinEnd;
+                        double score = joinStart * 1.2 + distance[end] + joinEnd * 1.2;
+                        if (score >= bestScore)
+                            continue;
 
-                        if (score < bestScore)
+                        List<GraphStep> path = Reconstruct(start, end, previous, via);
+                        if (path.Count >= 2)
                         {
                             bestScore = score;
-                            bestPath = ReconstructPath(start, end, previous);
+                            best = path;
                         }
                     }
                 }
 
-                if (bestPath == null || bestPath.Count < 2)
-                    return new List<CoastlinePoint>();
-
-                return bestPath.Select(i => Clone(_vertices[i].Point)).ToList();
+                return best;
             }
 
-            public List<CoastlinePoint> TryBuildClosedLoop(
+            public List<GraphStep> TryBuildClosedLoop(
                 List<int> component,
                 double targetLatitude,
                 double targetLongitude)
             {
-                var componentSet = component.ToHashSet();
-                List<int> degreeTwo = component
-                    .Where(i => _vertices[i].Edges.Count(e => componentSet.Contains(e.To)) == 2)
-                    .ToList();
+                if (component.Count < 3)
+                    return new List<GraphStep>();
 
-                if (degreeTwo.Count < 3)
-                    return new List<CoastlinePoint>();
-
-                int start = degreeTwo
+                var set = component.ToHashSet();
+                int start = component
                     .OrderBy(i => DistanceNm(
                         targetLatitude, targetLongitude,
-                        _vertices[i].Point.Latitude,
-                        _vertices[i].Point.Longitude))
+                        _vertices[i].Point.Latitude, _vertices[i].Point.Longitude))
                     .First();
 
-                var path = new List<int> { start };
+                // A proper coastline loop normally has degree 2 throughout. Start
+                // at the nearest vertex and walk one direction until returning.
                 int previous = -1;
                 int current = start;
-
-                for (int guard = 0; guard < component.Count + 10; guard++)
+                var output = new List<GraphStep>
                 {
-                    List<int> neighbours = _vertices[current].Edges
-                        .Select(e => e.To)
-                        .Where(componentSet.Contains)
-                        .Distinct()
+                    new GraphStep { Vertex = start, SeaBearing = 0 }
+                };
+                var visited = new HashSet<int> { start };
+
+                for (int guard = 0; guard < component.Count + 20; guard++)
+                {
+                    List<Edge> options = _vertices[current].Edges
+                        .Where(e => set.Contains(e.To) && e.To != previous)
+                        .OrderBy(e => e.IsBridge)
+                        .ThenBy(e => e.Weight)
                         .ToList();
 
-                    int next = neighbours.FirstOrDefault(n => n != previous, -1);
-                    if (next < 0)
-                        return new List<CoastlinePoint>();
+                    if (options.Count == 0)
+                        return new List<GraphStep>();
+
+                    Edge chosen = options[0];
+                    int next = chosen.To;
 
                     if (next == start)
                     {
-                        path.Add(start);
-                        return path.Select(i => Clone(_vertices[i].Point)).ToList();
+                        output.Add(new GraphStep { Vertex = start, SeaBearing = chosen.SeaBearing });
+                        return output;
                     }
 
-                    if (path.Contains(next))
-                        return new List<CoastlinePoint>();
+                    if (!visited.Add(next))
+                        return new List<GraphStep>();
 
-                    path.Add(next);
+                    output.Add(new GraphStep { Vertex = next, SeaBearing = chosen.SeaBearing });
                     previous = current;
                     current = next;
                 }
 
-                return new List<CoastlinePoint>();
+                return new List<GraphStep>();
             }
 
-            public List<CoastlinePoint> BuildLongestDetailedPath(List<int> component)
+            public List<CoastlinePoint> ToOffshorePoints(List<GraphStep> path, double offsetNm)
             {
-                if (component.Count < 2)
-                    return new List<CoastlinePoint>();
+                var output = new List<CoastlinePoint>();
+                if (path.Count == 0)
+                    return output;
 
-                var set = component.ToHashSet();
-                List<int> ends = component
-                    .Where(i => _vertices[i].Edges.Count(e => set.Contains(e.To)) <= 1)
-                    .ToList();
+                for (int i = 0; i < path.Count; i++)
+                {
+                    Vertex vertex = _vertices[path[i].Vertex];
+                    double seaBearing = path[i].SeaBearing;
 
-                int start = ends.Count > 0 ? ends[0] : component[0];
-                (double[] firstDistances, _) = DijkstraRestricted(start, set);
-                int farA = component.OrderByDescending(i => firstDistances[i]).First();
+                    // First point has no incoming edge, so use the next edge's
+                    // stored seaward bearing when available.
+                    if (i == 0 && path.Count > 1)
+                        seaBearing = path[1].SeaBearing;
 
-                (double[] secondDistances, int[] previous) = DijkstraRestricted(farA, set);
-                int farB = component.OrderByDescending(i => secondDistances[i]).First();
+                    output.Add(Destination(vertex.Point, seaBearing, offsetNm));
+                }
 
-                List<int> path = ReconstructPath(farA, farB, previous);
-                return path.Select(i => Clone(_vertices[i].Point)).ToList();
+                return output;
             }
 
             private int GetOrAdd(CoastlinePoint point)
             {
                 string key = Key(point);
-                if (_vertexByKey.TryGetValue(key, out int index))
+                if (_byKey.TryGetValue(key, out int index))
                     return index;
 
                 index = _vertices.Count;
                 _vertices.Add(new Vertex { Point = Clone(point) });
-                _vertexByKey[key] = index;
+                _byKey[key] = index;
                 return index;
             }
 
-            private static string Key(CoastlinePoint point) =>
-                $"{Math.Round(point.Latitude, 6):F6},{Math.Round(point.Longitude, 6):F6}";
+            private static string Key(CoastlinePoint p) =>
+                $"{Math.Round(p.Latitude, 6):F6},{Math.Round(p.Longitude, 6):F6}";
 
-            private void AddNeighbour(int from, int to, double weight)
+            private void AddEdge(int from, int to, double weight, double seaBearing, bool bridge)
             {
                 if (_vertices[from].Edges.Any(e => e.To == to))
                     return;
-                _vertices[from].Edges.Add(new Edge { To = to, Weight = weight });
+                _vertices[from].Edges.Add(new Edge
+                {
+                    To = to,
+                    Weight = weight,
+                    SeaBearing = seaBearing,
+                    IsBridge = bridge
+                });
             }
 
-            private int FindNearestVertex(double latitude, double longitude) =>
-                FindNearestVertices(latitude, longitude, 1).FirstOrDefault(-1);
+            private bool AreConnected(int a, int b) =>
+                _vertices[a].Edges.Any(e => e.To == b);
+
+            private int RealDegree(int index) =>
+                _vertices[index].Edges.Count(e => !e.IsBridge);
+
+            private int FindNearestVertex(double latitude, double longitude)
+            {
+                int[] values = FindNearestVertices(latitude, longitude, 1);
+                return values.Length == 0 ? -1 : values[0];
+            }
 
             private int[] FindNearestVertices(double latitude, double longitude, int count) =>
-                _vertices
-                    .Select((v, i) => new
-                    {
-                        Index = i,
-                        Distance = DistanceNm(
-                            latitude, longitude,
-                            v.Point.Latitude, v.Point.Longitude)
-                    })
-                    .OrderBy(x => x.Distance)
-                    .Take(Math.Min(count, _vertices.Count))
-                    .Select(x => x.Index)
-                    .ToArray();
+                _vertices.Select((v, i) => new
+                {
+                    Index = i,
+                    Distance = DistanceNm(latitude, longitude, v.Point.Latitude, v.Point.Longitude)
+                })
+                .OrderBy(x => x.Distance)
+                .Take(Math.Min(count, _vertices.Count))
+                .Select(x => x.Index)
+                .ToArray();
 
-            private (double[] Distances, int[] Previous) Dijkstra(int start)
-            {
-                var allowed = Enumerable.Range(0, _vertices.Count).ToHashSet();
-                return DijkstraRestricted(start, allowed);
-            }
-
-            private (double[] Distances, int[] Previous) DijkstraRestricted(
-                int start,
-                HashSet<int> allowed)
+            private (double[] Distance, int[] Previous, Edge?[] Via) Dijkstra(int start)
             {
                 double[] distance = Enumerable.Repeat(double.PositiveInfinity, _vertices.Count).ToArray();
                 int[] previous = Enumerable.Repeat(-1, _vertices.Count).ToArray();
+                Edge?[] via = new Edge?[_vertices.Count];
                 var queue = new PriorityQueue<int, double>();
 
                 distance[start] = 0;
@@ -621,43 +695,56 @@ namespace H145FlightPlanner.Services
 
                 while (queue.Count > 0)
                 {
-                    queue.TryDequeue(out int current, out double queuedDistance);
-                    if (queuedDistance > distance[current])
+                    queue.TryDequeue(out int current, out double queued);
+                    if (queued > distance[current])
                         continue;
 
                     foreach (Edge edge in _vertices[current].Edges)
                     {
-                        if (!allowed.Contains(edge.To))
-                            continue;
-
-                        double candidate = distance[current] + edge.Weight;
+                        // Real coastline is cheap. A synthetic micro-gap bridge is
+                        // deliberately expensive, so it is used only when needed.
+                        double cost = edge.Weight * (edge.IsBridge ? 18.0 : 1.0);
+                        double candidate = distance[current] + cost;
                         if (candidate >= distance[edge.To])
                             continue;
 
                         distance[edge.To] = candidate;
                         previous[edge.To] = current;
+                        via[edge.To] = edge;
                         queue.Enqueue(edge.To, candidate);
                     }
                 }
 
-                return (distance, previous);
+                return (distance, previous, via);
             }
 
-            private static List<int> ReconstructPath(int start, int end, int[] previous)
+            private List<GraphStep> Reconstruct(
+                int start,
+                int end,
+                int[] previous,
+                Edge?[] via)
             {
-                var path = new List<int>();
+                var reversed = new List<GraphStep>();
                 int current = end;
 
                 while (current >= 0)
                 {
-                    path.Add(current);
+                    Edge? incoming = via[current];
+                    reversed.Add(new GraphStep
+                    {
+                        Vertex = current,
+                        SeaBearing = incoming?.SeaBearing ?? 0
+                    });
+
                     if (current == start)
                         break;
                     current = previous[current];
                 }
 
-                path.Reverse();
-                return path.Count > 0 && path[0] == start ? path : new List<int>();
+                reversed.Reverse();
+                return reversed.Count > 0 && reversed[0].Vertex == start
+                    ? reversed
+                    : new List<GraphStep>();
             }
 
             private sealed class Vertex
@@ -670,7 +757,15 @@ namespace H145FlightPlanner.Services
             {
                 public int To { get; set; }
                 public double Weight { get; set; }
+                public double SeaBearing { get; set; }
+                public bool IsBridge { get; set; }
             }
+        }
+
+        private sealed class GraphStep
+        {
+            public int Vertex { get; set; }
+            public double SeaBearing { get; set; }
         }
     }
 }
