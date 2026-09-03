@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -65,7 +64,6 @@ namespace H145FlightPlanner.Routing
                 CruisingAltitudeFeet = altitude
             };
 
-            // Departure airport
             flightPlan.Waypoints.Add(
                 new RouteWaypoint
                 {
@@ -80,7 +78,7 @@ namespace H145FlightPlanner.Routing
             int waypointNumber = 1;
 
             // -------------------------------------------------
-            // ORBIT AROUND AN AIRPORT
+            // ORBIT TARGET
             // -------------------------------------------------
 
             if (LooksLikeIcao(request.OrbitLocation))
@@ -104,11 +102,6 @@ namespace H145FlightPlanner.Routing
                     altitude,
                     ref waypointNumber);
             }
-
-            // -------------------------------------------------
-            // ORBIT AROUND A PLACE
-            // -------------------------------------------------
-
             else
             {
                 GeographyResult? place =
@@ -132,8 +125,6 @@ namespace H145FlightPlanner.Routing
                 }
                 else
                 {
-                    // Fallback only when OpenStreetMap cannot give us
-                    // a usable boundary for the place.
                     AddCircularOrbit(
                         flightPlan,
                         place.Latitude,
@@ -145,7 +136,7 @@ namespace H145FlightPlanner.Routing
             }
 
             // -------------------------------------------------
-            // WHERE DO WE GO AFTER THE ORBIT?
+            // FINAL AIRPORT
             // -------------------------------------------------
 
             string finalAirportIdent =
@@ -154,9 +145,7 @@ namespace H145FlightPlanner.Routing
                     : request.Destination;
 
             if (string.IsNullOrWhiteSpace(finalAirportIdent))
-            {
                 finalAirportIdent = request.Departure;
-            }
 
             AirportResult? finalAirport =
                 await _airportService.FindByIcaoAsync(
@@ -209,12 +198,10 @@ namespace H145FlightPlanner.Routing
             double halfLongitude =
                 (place.EastLongitude - place.WestLongitude) / 2.0;
 
-            // Add some clearance so the route goes around the
-            // returned place boundary rather than directly over it.
+            // Keep the orbit just outside the returned place bounds.
             halfLatitude *= 1.20;
             halfLongitude *= 1.20;
 
-            // More points for larger places, fewer for smaller ones.
             double approximateSizeNm =
                 EstimateSizeNm(
                     place.SouthLatitude,
@@ -233,6 +220,9 @@ namespace H145FlightPlanner.Routing
             else
                 pointCount = 20;
 
+            double firstLatitude = 0;
+            double firstLongitude = 0;
+
             for (int i = 0; i < pointCount; i++)
             {
                 double angle =
@@ -245,6 +235,12 @@ namespace H145FlightPlanner.Routing
                 double longitude =
                     centreLongitude +
                     Math.Sin(angle) * halfLongitude;
+
+                if (i == 0)
+                {
+                    firstLatitude = latitude;
+                    firstLongitude = longitude;
+                }
 
                 flightPlan.Waypoints.Add(
                     new RouteWaypoint
@@ -259,6 +255,21 @@ namespace H145FlightPlanner.Routing
 
                 waypointNumber++;
             }
+
+            // Close the orbit completely by returning to
+            // the same position as the first orbit waypoint.
+            flightPlan.Waypoints.Add(
+                new RouteWaypoint
+                {
+                    Name = string.Empty,
+                    Ident = $"WP{waypointNumber}",
+                    Type = "USER",
+                    Latitude = firstLatitude,
+                    Longitude = firstLongitude,
+                    AltitudeFeet = altitude
+                });
+
+            waypointNumber++;
         }
 
         private static void AddCircularOrbit(
@@ -282,6 +293,9 @@ namespace H145FlightPlanner.Routing
                      Math.PI /
                      180.0));
 
+            double firstLatitude = 0;
+            double firstLongitude = 0;
+
             for (int i = 0; i < pointCount; i++)
             {
                 double angle =
@@ -297,6 +311,12 @@ namespace H145FlightPlanner.Routing
                     Math.Sin(angle) *
                     longitudeRadiusDegrees;
 
+                if (i == 0)
+                {
+                    firstLatitude = latitude;
+                    firstLongitude = longitude;
+                }
+
                 flightPlan.Waypoints.Add(
                     new RouteWaypoint
                     {
@@ -310,6 +330,20 @@ namespace H145FlightPlanner.Routing
 
                 waypointNumber++;
             }
+
+            // Close the circle.
+            flightPlan.Waypoints.Add(
+                new RouteWaypoint
+                {
+                    Name = string.Empty,
+                    Ident = $"WP{waypointNumber}",
+                    Type = "USER",
+                    Latitude = firstLatitude,
+                    Longitude = firstLongitude,
+                    AltitudeFeet = altitude
+                });
+
+            waypointNumber++;
         }
 
         private static double EstimateSizeNm(
