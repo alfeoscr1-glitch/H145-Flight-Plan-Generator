@@ -1,9 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
-using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -68,8 +68,6 @@ namespace H145FlightPlanner.Services
             string query =
                 Uri.EscapeDataString(cleanedName);
 
-            // Ask for several possibilities instead of blindly
-            // accepting the first OpenStreetMap result.
             string url =
                 $"https://nominatim.openstreetmap.org/search" +
                 $"?q={query}" +
@@ -99,13 +97,16 @@ namespace H145FlightPlanner.Services
 
             var results = new List<JsonElement>();
 
-            foreach (JsonElement element in document.RootElement.EnumerateArray())
+            foreach (JsonElement element
+                in document.RootElement.EnumerateArray())
             {
                 results.Add(element.Clone());
             }
 
             JsonElement? selected =
-                SelectBestPlaceResult(results);
+                SelectBestPlaceResult(
+                    results,
+                    cleanedName);
 
             if (selected == null)
                 return null;
@@ -160,14 +161,91 @@ namespace H145FlightPlanner.Services
         }
 
         private static JsonElement? SelectBestPlaceResult(
-            List<JsonElement> results)
+            List<JsonElement> results,
+            string requestedName)
         {
             if (results.Count == 0)
                 return null;
 
             // -------------------------------------------------
-            // PRIORITY 1:
-            // Actual populated places.
+            // EXPLICIT AVIATION TARGET
+            //
+            // If the user actually says helipad, heliport,
+            // airport or aerodrome, respect that request.
+            // -------------------------------------------------
+
+            bool wantsHelipad =
+                ContainsWord(
+                    requestedName,
+                    "helipad");
+
+            bool wantsHeliport =
+                ContainsWord(
+                    requestedName,
+                    "heliport");
+
+            bool wantsAirport =
+                ContainsWord(
+                    requestedName,
+                    "airport") ||
+                ContainsWord(
+                    requestedName,
+                    "aerodrome");
+
+            if (wantsHelipad)
+            {
+                JsonElement? result =
+                    FindByType(
+                        results,
+                        "helipad");
+
+                if (result != null)
+                    return result;
+            }
+
+            if (wantsHeliport)
+            {
+                JsonElement? result =
+                    FindByType(
+                        results,
+                        "heliport");
+
+                if (result != null)
+                    return result;
+            }
+
+            if (wantsAirport)
+            {
+                JsonElement? result =
+                    FindAirportResult(results);
+
+                if (result != null)
+                    return result;
+            }
+
+            if (wantsHelipad ||
+                wantsHeliport ||
+                wantsAirport)
+            {
+                JsonElement? aviationResult =
+                    FindByCategory(
+                        results,
+                        "aeroway");
+
+                if (aviationResult != null)
+                    return aviationResult;
+
+                // The user explicitly asked for an aviation
+                // object, so use Nominatim's best result rather
+                // than replacing it with a nearby town.
+                return results[0];
+            }
+
+            // -------------------------------------------------
+            // NORMAL PLACE SEARCH
+            //
+            // If no explicit aviation object was requested,
+            // prefer the actual populated place.
             // -------------------------------------------------
 
             string[] preferredPlaceTypes =
@@ -184,45 +262,35 @@ namespace H145FlightPlanner.Services
                 "locality"
             };
 
-            foreach (string preferredType in preferredPlaceTypes)
+            foreach (string preferredType
+                in preferredPlaceTypes)
             {
-                JsonElement? match =
-                    results.FirstOrDefaultNullable(
-                        result =>
-                            IsPlaceCategory(result) &&
-                            string.Equals(
-                                GetString(result, "type"),
-                                preferredType,
-                                StringComparison.OrdinalIgnoreCase));
-
-                if (match != null)
-                    return match;
+                foreach (JsonElement result in results)
+                {
+                    if (IsPlaceCategory(result) &&
+                        string.Equals(
+                            GetString(result, "type"),
+                            preferredType,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        return result;
+                    }
+                }
             }
 
-            // -------------------------------------------------
-            // PRIORITY 2:
-            // Other OSM objects classified as a place.
-            // -------------------------------------------------
-
+            // Other objects classified as an OSM place.
             foreach (JsonElement result in results)
             {
                 if (IsPlaceCategory(result))
                     return result;
             }
 
-            // -------------------------------------------------
-            // PRIORITY 3:
-            // Administrative boundaries can represent cities,
-            // towns and other named areas.
-            // -------------------------------------------------
-
+            // Administrative boundaries are also useful for
+            // named cities, towns and other populated areas.
             foreach (JsonElement result in results)
             {
-                string category =
-                    GetString(result, "category");
-
                 if (string.Equals(
-                    category,
+                    GetString(result, "category"),
                     "boundary",
                     StringComparison.OrdinalIgnoreCase))
                 {
@@ -230,26 +298,83 @@ namespace H145FlightPlanner.Services
                 }
             }
 
-            // -------------------------------------------------
-            // FALLBACK:
-            // If there genuinely isn't a settlement result,
-            // allow the best normal Nominatim result.
-            //
-            // This means an explicitly searched helipad,
-            // heliport, landmark, etc. can still work.
-            // -------------------------------------------------
-
             return results[0];
+        }
+
+        private static JsonElement? FindByType(
+            List<JsonElement> results,
+            string type)
+        {
+            foreach (JsonElement result in results)
+            {
+                if (string.Equals(
+                    GetString(result, "type"),
+                    type,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return result;
+                }
+            }
+
+            return null;
+        }
+
+        private static JsonElement? FindAirportResult(
+            List<JsonElement> results)
+        {
+            string[] airportTypes =
+            {
+                "aerodrome",
+                "airport"
+            };
+
+            foreach (string type in airportTypes)
+            {
+                JsonElement? result =
+                    FindByType(
+                        results,
+                        type);
+
+                if (result != null)
+                    return result;
+            }
+
+            return null;
+        }
+
+        private static JsonElement? FindByCategory(
+            List<JsonElement> results,
+            string category)
+        {
+            foreach (JsonElement result in results)
+            {
+                if (string.Equals(
+                    GetString(result, "category"),
+                    category,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return result;
+                }
+            }
+
+            return null;
+        }
+
+        private static bool ContainsWord(
+            string text,
+            string word)
+        {
+            return Regex.IsMatch(
+                text,
+                $@"\b{Regex.Escape(word)}\b",
+                RegexOptions.IgnoreCase);
         }
 
         private static bool IsPlaceCategory(
             JsonElement result)
         {
-            string category =
-                GetString(result, "category");
-
             return string.Equals(
-                category,
+                GetString(result, "category"),
                 "place",
                 StringComparison.OrdinalIgnoreCase);
         }
@@ -367,22 +492,6 @@ namespace H145FlightPlanner.Services
             }
 
             return 0;
-        }
-    }
-
-    internal static class JsonElementExtensions
-    {
-        public static JsonElement? FirstOrDefaultNullable(
-            this IEnumerable<JsonElement> source,
-            Func<JsonElement, bool> predicate)
-        {
-            foreach (JsonElement item in source)
-            {
-                if (predicate(item))
-                    return item;
-            }
-
-            return null;
         }
     }
 }
