@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
@@ -10,27 +11,28 @@ using H145FlightPlanner.Models;
 
 namespace H145FlightPlanner.Services
 {
+    // This service treats "coastline" as the visible outer land/sea edge.
+    // It does not use administrative borders. It downloads detailed OSM edge
+    // vectors inside a route-sized view, builds a graph, and traces the edge.
     public class CoastlineGeometryService
     {
-        private static readonly HttpClient HttpClient =
-            CreateHttpClient();
+        private static readonly HttpClient HttpClient = CreateHttpClient();
+
+        private static readonly string[] OverpassEndpoints =
+        {
+            "https://overpass-api.de/api/interpreter",
+            "https://overpass.private.coffee/api/interpreter",
+            "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+        };
 
         private static HttpClient CreateHttpClient()
         {
             var client = new HttpClient();
-
             client.DefaultRequestHeaders.UserAgent.ParseAdd(
                 "H145FlightPlanGenerator/1.0");
-
-            client.Timeout =
-                TimeSpan.FromSeconds(45);
-
+            client.Timeout = TimeSpan.FromSeconds(60);
             return client;
         }
-
-        // =====================================================
-        // AROUND
-        // =====================================================
 
         public async Task<CoastlineGeometry> GetAroundCoastlineAsync(
             GeographyResult area,
@@ -39,1599 +41,339 @@ namespace H145FlightPlanner.Services
             if (area == null)
                 throw new ArgumentNullException(nameof(area));
 
-            JsonElement? geoJson =
-                await GetExactPlaceGeometryAsync(
-                    area,
-                    cancellationToken);
+            double south;
+            double north;
+            double west;
+            double east;
 
-            if (geoJson == null)
+            if (area.HasBoundingBox)
             {
-                throw new InvalidOperationException(
-                    $"The detailed outline for {area.Name} could not be found.");
+                south = area.SouthLatitude;
+                north = area.NorthLatitude;
+                west = area.WestLongitude;
+                east = area.EastLongitude;
+            }
+            else
+            {
+                const double fallback = 0.35;
+                south = area.Latitude - fallback;
+                north = area.Latitude + fallback;
+                west = area.Longitude - fallback;
+                east = area.Longitude + fallback;
             }
 
-            List<List<CoastlinePoint>> outerRings =
-                ExtractOuterRings(
-                    geoJson.Value);
+            ExpandBoundingBox(ref south, ref north, ref west, ref east, 0.35, 0.08);
 
-            if (outerRings.Count == 0)
+            LandEdgeGraph graph = await DownloadGraphAsync(
+                south, north, west, east, cancellationToken);
+
+            List<int> component =
+                graph.GetComponentNearest(area.Latitude, area.Longitude);
+
+            if (component.Count < 3)
             {
                 throw new InvalidOperationException(
-                    $"No usable outer outline was found for {area.Name}.");
+                    $"A detailed outer land edge could not be traced around {area.Name}.");
             }
 
-            List<CoastlinePoint> outline =
-                SelectBestRing(
-                    outerRings,
-                    area.Latitude,
-                    area.Longitude);
+            List<CoastlinePoint> ordered =
+                graph.TryBuildClosedLoop(component, area.Latitude, area.Longitude);
 
-            if (outline.Count < 3)
+            bool closed = ordered.Count >= 4 &&
+                          DistanceNm(ordered[0], ordered[^1]) < 0.02;
+
+            if (!closed)
+            {
+                // Regions such as counties can have only a section of sea-facing
+                // edge inside their bounds. In that case trace the longest detailed
+                // edge section rather than inventing an oval or admin-border loop.
+                ordered = graph.BuildLongestDetailedPath(component);
+            }
+
+            if (ordered.Count < 2)
             {
                 throw new InvalidOperationException(
-                    $"The outline for {area.Name} was not detailed enough.");
+                    $"No usable detailed outer edge was found for {area.Name}.");
             }
 
-            EnsureClosed(outline);
-
-            // Put the helicopter just outside the land boundary.
-            List<CoastlinePoint> outsideOutline =
-                OffsetOutsidePolygon(
-                    outline,
-                    0.12);
-
-            // Keep detail around bends/headlands while avoiding
-            // thousands of unnecessary points on straight edges.
-            List<CoastlinePoint> simplified =
-                SimplifyClosedOutline(
-                    outsideOutline,
-                    0.06,
-                    0.65,
-                    1400);
+            ordered = Densify(ordered, 0.12, 3000, closed);
 
             return new CoastlineGeometry
             {
-                Points = simplified,
-                IsClosed = true,
-                SourceDescription =
-                    "OpenStreetMap place outline geometry"
+                Points = ordered,
+                IsClosed = closed,
+                SourceDescription = "OpenStreetMap detailed land/sea edge"
             };
         }
 
-        // =====================================================
-        // ALONG
-        // =====================================================
-
-        public async Task<CoastlineGeometry> GetAlongCoastlineAsync(
+        public Task<CoastlineGeometry> GetAlongCoastlineAsync(
             AirportResult departure,
             AirportResult destination,
             CancellationToken cancellationToken = default)
         {
             if (departure == null)
                 throw new ArgumentNullException(nameof(departure));
-
             if (destination == null)
                 throw new ArgumentNullException(nameof(destination));
 
-            string? regionName =
-                await FindCommonRegionAsync(
-                    departure.Latitude,
-                    departure.Longitude,
-                    destination.Latitude,
-                    destination.Longitude,
-                    cancellationToken);
-
-            if (string.IsNullOrWhiteSpace(regionName))
-            {
-                throw new InvalidOperationException(
-                    "A common geographic area could not be identified " +
-                    "between the departure and destination.");
-            }
-
-            JsonElement? regionGeometry =
-                await SearchPlaceGeometryAsync(
-                    regionName,
-                    cancellationToken);
-
-            if (regionGeometry == null)
-            {
-                throw new InvalidOperationException(
-                    $"The outer layout of {regionName} could not be found.");
-            }
-
-            List<List<CoastlinePoint>> rings =
-                ExtractOuterRings(
-                    regionGeometry.Value);
-
-            if (rings.Count == 0)
-            {
-                throw new InvalidOperationException(
-                    $"No usable outer layout was found for {regionName}.");
-            }
-
-            double middleLatitude =
-                (departure.Latitude +
-                 destination.Latitude) /
-                2.0;
-
-            double middleLongitude =
-                (departure.Longitude +
-                 destination.Longitude) /
-                2.0;
-
-            List<CoastlinePoint> outline =
-                SelectBestRing(
-                    rings,
-                    middleLatitude,
-                    middleLongitude);
-
-            EnsureClosed(outline);
-
-            List<CoastlinePoint> route =
-                ExtractBestBoundarySection(
-                    outline,
-                    departure.Latitude,
-                    departure.Longitude,
-                    destination.Latitude,
-                    destination.Longitude);
-
-            if (route.Count < 2)
-            {
-                throw new InvalidOperationException(
-                    "A usable outer-edge route could not be created.");
-            }
-
-            List<CoastlinePoint> outsideRoute =
-                OffsetOutsideOpenSection(
-                    route,
-                    outline,
-                    0.12);
-
-            List<CoastlinePoint> simplified =
-                SimplifyOpenOutline(
-                    outsideRoute,
-                    0.06,
-                    0.65,
-                    1400);
-
-            return new CoastlineGeometry
-            {
-                Points = simplified,
-                IsClosed = false,
-                SourceDescription =
-                    $"OpenStreetMap outer layout of {regionName}"
-            };
+            return GetAlongCoastlineAsync(
+                departure.Latitude,
+                departure.Longitude,
+                destination.Latitude,
+                destination.Longitude,
+                cancellationToken);
         }
 
-        // =====================================================
-        // EXACT PLACE GEOMETRY
-        // =====================================================
-
-        private static async Task<JsonElement?>
-            GetExactPlaceGeometryAsync(
-                GeographyResult area,
-                CancellationToken cancellationToken)
+        public async Task<CoastlineGeometry> GetAlongCoastlineAsync(
+            double startLatitude,
+            double startLongitude,
+            double endLatitude,
+            double endLongitude,
+            CancellationToken cancellationToken = default)
         {
-            string prefix =
-                area.OsmType.ToLowerInvariant() switch
+            Exception? lastError = null;
+
+            // Increasing view sizes emulate zooming out until the full requested
+            // coastal route is visible and connected, without using screenshots.
+            double[] expansionFactors = { 0.20, 0.45, 0.85 };
+
+            foreach (double factor in expansionFactors)
+            {
+                double south = Math.Min(startLatitude, endLatitude);
+                double north = Math.Max(startLatitude, endLatitude);
+                double west = Math.Min(startLongitude, endLongitude);
+                double east = Math.Max(startLongitude, endLongitude);
+
+                ExpandBoundingBox(
+                    ref south, ref north, ref west, ref east, factor, 0.12);
+
+                try
                 {
-                    "relation" => "R",
-                    "way" => "W",
-                    "node" => "N",
-                    _ => string.Empty
-                };
+                    LandEdgeGraph graph = await DownloadGraphAsync(
+                        south, north, west, east, cancellationToken);
 
-            if (!string.IsNullOrWhiteSpace(prefix) &&
-                area.OsmId > 0)
-            {
-                string osmId =
-                    $"{prefix}{area.OsmId}";
+                    List<CoastlinePoint> route =
+                        graph.FindBestConnectedPath(
+                            startLatitude,
+                            startLongitude,
+                            endLatitude,
+                            endLongitude);
 
-                string lookupUrl =
-                    "https://nominatim.openstreetmap.org/lookup" +
-                    $"?osm_ids={Uri.EscapeDataString(osmId)}" +
-                    "&format=jsonv2" +
-                    "&polygon_geojson=1";
-
-                JsonElement? lookupGeometry =
-                    await DownloadFirstGeometryAsync(
-                        lookupUrl,
-                        cancellationToken);
-
-                if (lookupGeometry != null)
-                    return lookupGeometry;
-            }
-
-            if (!string.IsNullOrWhiteSpace(area.Name))
-            {
-                JsonElement? searchGeometry =
-                    await SearchPlaceGeometryAsync(
-                        area.Name,
-                        cancellationToken);
-
-                if (searchGeometry != null)
-                    return searchGeometry;
-            }
-
-            if (!string.IsNullOrWhiteSpace(area.DisplayName))
-            {
-                return await SearchPlaceGeometryAsync(
-                    area.DisplayName,
-                    cancellationToken);
-            }
-
-            return null;
-        }
-
-        private static async Task<JsonElement?>
-            SearchPlaceGeometryAsync(
-                string placeName,
-                CancellationToken cancellationToken)
-        {
-            string query =
-                Uri.EscapeDataString(
-                    placeName);
-
-            string url =
-                "https://nominatim.openstreetmap.org/search" +
-                $"?q={query}" +
-                "&format=jsonv2" +
-                "&limit=10" +
-                "&dedupe=0" +
-                "&namedetails=1" +
-                "&polygon_geojson=1" +
-                "&countrycodes=gb,im,ie,gg,je";
-
-            using HttpResponseMessage response =
-                await HttpClient.GetAsync(
-                    url,
-                    cancellationToken);
-
-            response.EnsureSuccessStatusCode();
-
-            string json =
-                await response.Content.ReadAsStringAsync(
-                    cancellationToken);
-
-            using JsonDocument document =
-                JsonDocument.Parse(json);
-
-            if (document.RootElement.ValueKind !=
-                JsonValueKind.Array)
-            {
-                return null;
-            }
-
-            foreach (JsonElement result
-                in document.RootElement.EnumerateArray())
-            {
-                if (!result.TryGetProperty(
-                    "geojson",
-                    out JsonElement geoJson))
-                {
-                    continue;
-                }
-
-                if (IsPolygonGeometry(geoJson))
-                {
-                    return geoJson.Clone();
-                }
-            }
-
-            return null;
-        }
-
-        private static async Task<JsonElement?>
-            DownloadFirstGeometryAsync(
-                string url,
-                CancellationToken cancellationToken)
-        {
-            using HttpResponseMessage response =
-                await HttpClient.GetAsync(
-                    url,
-                    cancellationToken);
-
-            response.EnsureSuccessStatusCode();
-
-            string json =
-                await response.Content.ReadAsStringAsync(
-                    cancellationToken);
-
-            using JsonDocument document =
-                JsonDocument.Parse(json);
-
-            if (document.RootElement.ValueKind !=
-                    JsonValueKind.Array ||
-                document.RootElement.GetArrayLength() == 0)
-            {
-                return null;
-            }
-
-            foreach (JsonElement result
-                in document.RootElement.EnumerateArray())
-            {
-                if (result.TryGetProperty(
-                        "geojson",
-                        out JsonElement geoJson) &&
-                    IsPolygonGeometry(geoJson))
-                {
-                    return geoJson.Clone();
-                }
-            }
-
-            return null;
-        }
-
-        private static bool IsPolygonGeometry(
-            JsonElement geoJson)
-        {
-            if (!geoJson.TryGetProperty(
-                "type",
-                out JsonElement typeElement))
-            {
-                return false;
-            }
-
-            string type =
-                typeElement.GetString() ??
-                string.Empty;
-
-            return
-                string.Equals(
-                    type,
-                    "Polygon",
-                    StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(
-                    type,
-                    "MultiPolygon",
-                    StringComparison.OrdinalIgnoreCase);
-        }
-
-        // =====================================================
-        // REGION LOOKUP FOR "ALONG"
-        // =====================================================
-
-        private static async Task<string?>
-            FindCommonRegionAsync(
-                double startLatitude,
-                double startLongitude,
-                double endLatitude,
-                double endLongitude,
-                CancellationToken cancellationToken)
-        {
-            Dictionary<string, string> start =
-                await ReverseAddressAsync(
-                    startLatitude,
-                    startLongitude,
-                    cancellationToken);
-
-            Dictionary<string, string> end =
-                await ReverseAddressAsync(
-                    endLatitude,
-                    endLongitude,
-                    cancellationToken);
-
-            string[] preferredLevels =
-            {
-                "state",
-                "region",
-                "province",
-                "state_district",
-                "country"
-            };
-
-            foreach (string level
-                in preferredLevels)
-            {
-                if (!start.TryGetValue(
-                        level,
-                        out string? startValue) ||
-                    !end.TryGetValue(
-                        level,
-                        out string? endValue))
-                {
-                    continue;
-                }
-
-                if (string.Equals(
-                    startValue,
-                    endValue,
-                    StringComparison.OrdinalIgnoreCase))
-                {
-                    return startValue;
-                }
-            }
-
-            if (start.TryGetValue(
-                    "country",
-                    out string? startCountry) &&
-                end.TryGetValue(
-                    "country",
-                    out string? endCountry) &&
-                string.Equals(
-                    startCountry,
-                    endCountry,
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                return startCountry;
-            }
-
-            return null;
-        }
-
-        private static async Task<Dictionary<string, string>>
-            ReverseAddressAsync(
-                double latitude,
-                double longitude,
-                CancellationToken cancellationToken)
-        {
-            string lat =
-                latitude.ToString(
-                    CultureInfo.InvariantCulture);
-
-            string lon =
-                longitude.ToString(
-                    CultureInfo.InvariantCulture);
-
-            string url =
-                "https://nominatim.openstreetmap.org/reverse" +
-                $"?lat={lat}" +
-                $"&lon={lon}" +
-                "&format=jsonv2" +
-                "&zoom=10" +
-                "&addressdetails=1";
-
-            using HttpResponseMessage response =
-                await HttpClient.GetAsync(
-                    url,
-                    cancellationToken);
-
-            response.EnsureSuccessStatusCode();
-
-            string json =
-                await response.Content.ReadAsStringAsync(
-                    cancellationToken);
-
-            using JsonDocument document =
-                JsonDocument.Parse(json);
-
-            var address =
-                new Dictionary<string, string>(
-                    StringComparer.OrdinalIgnoreCase);
-
-            if (!document.RootElement.TryGetProperty(
-                "address",
-                out JsonElement addressElement) ||
-                addressElement.ValueKind !=
-                    JsonValueKind.Object)
-            {
-                return address;
-            }
-
-            foreach (JsonProperty property
-                in addressElement.EnumerateObject())
-            {
-                if (property.Value.ValueKind !=
-                    JsonValueKind.String)
-                {
-                    continue;
-                }
-
-                string? value =
-                    property.Value.GetString();
-
-                if (!string.IsNullOrWhiteSpace(value))
-                {
-                    address[property.Name] =
-                        value;
-                }
-            }
-
-            return address;
-        }
-
-        // =====================================================
-        // GEOJSON OUTER RINGS
-        // =====================================================
-
-        private static List<List<CoastlinePoint>>
-            ExtractOuterRings(
-                JsonElement geoJson)
-        {
-            var rings =
-                new List<List<CoastlinePoint>>();
-
-            if (!geoJson.TryGetProperty(
-                    "type",
-                    out JsonElement typeElement) ||
-                !geoJson.TryGetProperty(
-                    "coordinates",
-                    out JsonElement coordinates))
-            {
-                return rings;
-            }
-
-            string type =
-                typeElement.GetString() ??
-                string.Empty;
-
-            if (string.Equals(
-                type,
-                "Polygon",
-                StringComparison.OrdinalIgnoreCase))
-            {
-                if (coordinates.ValueKind ==
-                        JsonValueKind.Array &&
-                    coordinates.GetArrayLength() > 0)
-                {
-                    List<CoastlinePoint> ring =
-                        ReadRing(
-                            coordinates[0]);
-
-                    if (ring.Count >= 3)
-                        rings.Add(ring);
-                }
-            }
-            else if (string.Equals(
-                type,
-                "MultiPolygon",
-                StringComparison.OrdinalIgnoreCase))
-            {
-                foreach (JsonElement polygon
-                    in coordinates.EnumerateArray())
-                {
-                    if (polygon.ValueKind !=
-                            JsonValueKind.Array ||
-                        polygon.GetArrayLength() == 0)
+                    if (route.Count >= 2)
                     {
-                        continue;
-                    }
+                        route = Densify(route, 0.12, 3000, false);
 
-                    List<CoastlinePoint> ring =
-                        ReadRing(
-                            polygon[0]);
-
-                    if (ring.Count >= 3)
-                        rings.Add(ring);
-                }
-            }
-
-            return rings;
-        }
-
-        private static List<CoastlinePoint> ReadRing(
-            JsonElement ringElement)
-        {
-            var result =
-                new List<CoastlinePoint>();
-
-            if (ringElement.ValueKind !=
-                JsonValueKind.Array)
-            {
-                return result;
-            }
-
-            foreach (JsonElement coordinate
-                in ringElement.EnumerateArray())
-            {
-                if (coordinate.ValueKind !=
-                        JsonValueKind.Array ||
-                    coordinate.GetArrayLength() < 2 ||
-                    coordinate[0].ValueKind !=
-                        JsonValueKind.Number ||
-                    coordinate[1].ValueKind !=
-                        JsonValueKind.Number)
-                {
-                    continue;
-                }
-
-                result.Add(
-                    new CoastlinePoint
-                    {
-                        Longitude =
-                            coordinate[0].GetDouble(),
-
-                        Latitude =
-                            coordinate[1].GetDouble()
-                    });
-            }
-
-            return result;
-        }
-
-        private static List<CoastlinePoint> SelectBestRing(
-            List<List<CoastlinePoint>> rings,
-            double targetLatitude,
-            double targetLongitude)
-        {
-            return rings
-                .OrderBy(ring =>
-                    DistanceToOutlineNm(
-                        targetLatitude,
-                        targetLongitude,
-                        ring))
-                .ThenByDescending(ring =>
-                    AbsolutePolygonArea(ring))
-                .First();
-        }
-
-        // =====================================================
-        // OUTSIDE OFFSET
-        // =====================================================
-
-        private static List<CoastlinePoint>
-            OffsetOutsidePolygon(
-                List<CoastlinePoint> polygon,
-                double offsetNm)
-        {
-            List<CoastlinePoint> working =
-                RemoveDuplicateClosure(
-                    polygon);
-
-            if (working.Count < 3)
-                return polygon;
-
-            bool counterClockwise =
-                SignedPolygonArea(
-                    working) >
-                0;
-
-            var result =
-                new List<CoastlinePoint>(
-                    working.Count + 1);
-
-            for (int i = 0;
-                 i < working.Count;
-                 i++)
-            {
-                CoastlinePoint previous =
-                    working[
-                        (i - 1 +
-                         working.Count) %
-                        working.Count];
-
-                CoastlinePoint current =
-                    working[i];
-
-                CoastlinePoint next =
-                    working[
-                        (i + 1) %
-                        working.Count];
-
-                double bearing =
-                    BearingDegrees(
-                        previous.Latitude,
-                        previous.Longitude,
-                        next.Latitude,
-                        next.Longitude);
-
-                // CCW polygon:
-                // interior is on the left,
-                // therefore outside is on the right.
-                //
-                // CW polygon:
-                // interior is on the right,
-                // therefore outside is on the left.
-                double outwardBearing =
-                    counterClockwise
-                        ? bearing + 90.0
-                        : bearing - 90.0;
-
-                result.Add(
-                    DestinationPoint(
-                        current,
-                        NormalizeBearing(
-                            outwardBearing),
-                        offsetNm));
-            }
-
-            EnsureClosed(result);
-
-            return result;
-        }
-
-        private static List<CoastlinePoint>
-            OffsetOutsideOpenSection(
-                List<CoastlinePoint> section,
-                List<CoastlinePoint> fullPolygon,
-                double offsetNm)
-        {
-            List<CoastlinePoint> polygon =
-                RemoveDuplicateClosure(
-                    fullPolygon);
-
-            bool counterClockwise =
-                SignedPolygonArea(
-                    polygon) >
-                0;
-
-            var result =
-                new List<CoastlinePoint>(
-                    section.Count);
-
-            for (int i = 0;
-                 i < section.Count;
-                 i++)
-            {
-                CoastlinePoint previous =
-                    section[
-                        i == 0
-                            ? 0
-                            : i - 1];
-
-                CoastlinePoint current =
-                    section[i];
-
-                CoastlinePoint next =
-                    section[
-                        i == section.Count - 1
-                            ? section.Count - 1
-                            : i + 1];
-
-                double bearing =
-                    BearingDegrees(
-                        previous.Latitude,
-                        previous.Longitude,
-                        next.Latitude,
-                        next.Longitude);
-
-                double outwardBearing =
-                    counterClockwise
-                        ? bearing + 90.0
-                        : bearing - 90.0;
-
-                result.Add(
-                    DestinationPoint(
-                        current,
-                        NormalizeBearing(
-                            outwardBearing),
-                        offsetNm));
-            }
-
-            return result;
-        }
-
-        // =====================================================
-        // ALONG SECTION
-        // =====================================================
-
-        private static List<CoastlinePoint>
-            ExtractBestBoundarySection(
-                List<CoastlinePoint> closedOutline,
-                double startLatitude,
-                double startLongitude,
-                double endLatitude,
-                double endLongitude)
-        {
-            List<CoastlinePoint> outline =
-                RemoveDuplicateClosure(
-                    closedOutline);
-
-            int startIndex =
-                FindNearestPointIndex(
-                    outline,
-                    startLatitude,
-                    startLongitude);
-
-            int endIndex =
-                FindNearestPointIndex(
-                    outline,
-                    endLatitude,
-                    endLongitude);
-
-            if (startIndex < 0 ||
-                endIndex < 0 ||
-                startIndex == endIndex)
-            {
-                return new List<CoastlinePoint>();
-            }
-
-            List<CoastlinePoint> forward =
-                CircularSlice(
-                    outline,
-                    startIndex,
-                    endIndex,
-                    1);
-
-            List<CoastlinePoint> backward =
-                CircularSlice(
-                    outline,
-                    startIndex,
-                    endIndex,
-                    -1);
-
-            double forwardLength =
-                ChainLengthNm(
-                    forward);
-
-            double backwardLength =
-                ChainLengthNm(
-                    backward);
-
-            // For a coastline-style route between two points,
-            // choose the shorter outside-edge path.
-            return forwardLength <= backwardLength
-                ? forward
-                : backward;
-        }
-
-        private static List<CoastlinePoint> CircularSlice(
-            List<CoastlinePoint> points,
-            int startIndex,
-            int endIndex,
-            int step)
-        {
-            var result =
-                new List<CoastlinePoint>();
-
-            int index =
-                startIndex;
-
-            for (int guard = 0;
-                 guard <= points.Count + 1;
-                 guard++)
-            {
-                result.Add(
-                    points[index]);
-
-                if (index == endIndex)
-                    break;
-
-                index =
-                    (index +
-                     step +
-                     points.Count) %
-                    points.Count;
-            }
-
-            return result;
-        }
-
-        // =====================================================
-        // SIMPLIFICATION
-        // =====================================================
-
-        private static List<CoastlinePoint>
-            SimplifyClosedOutline(
-                List<CoastlinePoint> points,
-                double toleranceNm,
-                double maxSegmentNm,
-                int maxPoints)
-        {
-            List<CoastlinePoint> working =
-                RemoveDuplicateClosure(
-                    points);
-
-            if (working.Count < 4)
-            {
-                EnsureClosed(working);
-                return working;
-            }
-
-            int firstIndex =
-                0;
-
-            int oppositeIndex =
-                FindFarthestPointIndex(
-                    working,
-                    firstIndex);
-
-            List<CoastlinePoint> firstHalf =
-                CircularSlice(
-                    working,
-                    firstIndex,
-                    oppositeIndex,
-                    1);
-
-            List<CoastlinePoint> secondHalf =
-                CircularSlice(
-                    working,
-                    oppositeIndex,
-                    firstIndex,
-                    1);
-
-            firstHalf =
-                RamerDouglasPeucker(
-                    firstHalf,
-                    toleranceNm);
-
-            secondHalf =
-                RamerDouglasPeucker(
-                    secondHalf,
-                    toleranceNm);
-
-            var simplified =
-                new List<CoastlinePoint>();
-
-            simplified.AddRange(
-                firstHalf.Take(
-                    firstHalf.Count - 1));
-
-            simplified.AddRange(
-                secondHalf.Take(
-                    secondHalf.Count - 1));
-
-            simplified =
-                EnforceMaximumSegmentLength(
-                    simplified,
-                    maxSegmentNm,
-                    true);
-
-            simplified =
-                LimitPoints(
-                    simplified,
-                    maxPoints,
-                    true);
-
-            EnsureClosed(
-                simplified);
-
-            return simplified;
-        }
-
-        private static List<CoastlinePoint>
-            SimplifyOpenOutline(
-                List<CoastlinePoint> points,
-                double toleranceNm,
-                double maxSegmentNm,
-                int maxPoints)
-        {
-            List<CoastlinePoint> simplified =
-                RamerDouglasPeucker(
-                    points,
-                    toleranceNm);
-
-            simplified =
-                EnforceMaximumSegmentLength(
-                    simplified,
-                    maxSegmentNm,
-                    false);
-
-            return LimitPoints(
-                simplified,
-                maxPoints,
-                false);
-        }
-
-        private static List<CoastlinePoint>
-            RamerDouglasPeucker(
-                List<CoastlinePoint> points,
-                double toleranceNm)
-        {
-            if (points.Count <= 2)
-                return new List<CoastlinePoint>(points);
-
-            int index =
-                -1;
-
-            double maximumDistance =
-                0;
-
-            CoastlinePoint start =
-                points[0];
-
-            CoastlinePoint end =
-                points[^1];
-
-            for (int i = 1;
-                 i < points.Count - 1;
-                 i++)
-            {
-                double distance =
-                    PerpendicularDistanceNm(
-                        points[i],
-                        start,
-                        end);
-
-                if (distance >
-                    maximumDistance)
-                {
-                    maximumDistance =
-                        distance;
-
-                    index =
-                        i;
-                }
-            }
-
-            if (index >= 0 &&
-                maximumDistance >
-                toleranceNm)
-            {
-                List<CoastlinePoint> first =
-                    RamerDouglasPeucker(
-                        points
-                            .Take(index + 1)
-                            .ToList(),
-                        toleranceNm);
-
-                List<CoastlinePoint> second =
-                    RamerDouglasPeucker(
-                        points
-                            .Skip(index)
-                            .ToList(),
-                        toleranceNm);
-
-                return first
-                    .Take(first.Count - 1)
-                    .Concat(second)
-                    .ToList();
-            }
-
-            return new List<CoastlinePoint>
-            {
-                start,
-                end
-            };
-        }
-
-        private static List<CoastlinePoint>
-            EnforceMaximumSegmentLength(
-                List<CoastlinePoint> points,
-                double maxSegmentNm,
-                bool closed)
-        {
-            if (points.Count < 2)
-                return new List<CoastlinePoint>(points);
-
-            var result =
-                new List<CoastlinePoint>();
-
-            int segmentCount =
-                closed
-                    ? points.Count
-                    : points.Count - 1;
-
-            for (int i = 0;
-                 i < segmentCount;
-                 i++)
-            {
-                CoastlinePoint start =
-                    points[i];
-
-                CoastlinePoint end =
-                    points[
-                        (i + 1) %
-                        points.Count];
-
-                if (i == 0)
-                    result.Add(start);
-
-                double distance =
-                    DistanceNm(
-                        start.Latitude,
-                        start.Longitude,
-                        end.Latitude,
-                        end.Longitude);
-
-                int sections =
-                    Math.Max(
-                        1,
-                        (int)Math.Ceiling(
-                            distance /
-                            maxSegmentNm));
-
-                for (int section = 1;
-                     section <= sections;
-                     section++)
-                {
-                    double fraction =
-                        section /
-                        (double)sections;
-
-                    CoastlinePoint point =
-                        new CoastlinePoint
+                        return new CoastlineGeometry
                         {
-                            Latitude =
-                                start.Latitude +
-                                (end.Latitude -
-                                 start.Latitude) *
-                                fraction,
-
-                            Longitude =
-                                start.Longitude +
-                                (end.Longitude -
-                                 start.Longitude) *
-                                fraction
+                            Points = route,
+                            IsClosed = false,
+                            SourceDescription = "OpenStreetMap detailed land/sea edge"
                         };
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    lastError = ex;
+                }
+            }
 
-                    if (closed &&
-                        i == segmentCount - 1 &&
-                        section == sections)
+            throw new InvalidOperationException(
+                "A continuous detailed outer land edge could not be traced between the requested locations.",
+                lastError);
+        }
+
+        private static async Task<LandEdgeGraph> DownloadGraphAsync(
+            double south,
+            double north,
+            double west,
+            double east,
+            CancellationToken cancellationToken)
+        {
+            string bbox = string.Format(
+                CultureInfo.InvariantCulture,
+                "{0},{1},{2},{3}", south, west, north, east);
+
+            string query =
+                $"""
+                [out:json][timeout:45];
+                way["natural"="coastline"]({bbox});
+                out geom;
+                """;
+
+            var errors = new List<string>();
+
+            foreach (string endpoint in OverpassEndpoints)
+            {
+                try
+                {
+                    using var content = new FormUrlEncodedContent(
+                        new[] { new KeyValuePair<string, string>("data", query) });
+
+                    using HttpResponseMessage response =
+                        await HttpClient.PostAsync(endpoint, content, cancellationToken);
+
+                    if (IsTemporaryFailure(response.StatusCode))
+                    {
+                        errors.Add($"{endpoint}: {(int)response.StatusCode}");
+                        continue;
+                    }
+
+                    response.EnsureSuccessStatusCode();
+
+                    string json =
+                        await response.Content.ReadAsStringAsync(cancellationToken);
+
+                    LandEdgeGraph graph = ParseGraph(json);
+                    if (graph.VertexCount > 1)
+                        return graph;
+                }
+                catch (Exception ex) when (ex is HttpRequestException or JsonException)
+                {
+                    errors.Add($"{endpoint}: {ex.Message}");
+                }
+            }
+
+            throw new InvalidOperationException(
+                "Detailed map-edge data could not be downloaded." +
+                (errors.Count == 0 ? string.Empty : "\r\n" + string.Join("\r\n", errors)));
+        }
+
+        private static LandEdgeGraph ParseGraph(string json)
+        {
+            using JsonDocument document = JsonDocument.Parse(json);
+            var graph = new LandEdgeGraph();
+
+            if (!document.RootElement.TryGetProperty("elements", out JsonElement elements) ||
+                elements.ValueKind != JsonValueKind.Array)
+            {
+                return graph;
+            }
+
+            foreach (JsonElement element in elements.EnumerateArray())
+            {
+                if (!element.TryGetProperty("geometry", out JsonElement geometry) ||
+                    geometry.ValueKind != JsonValueKind.Array)
+                {
+                    continue;
+                }
+
+                CoastlinePoint? previous = null;
+
+                foreach (JsonElement point in geometry.EnumerateArray())
+                {
+                    if (!point.TryGetProperty("lat", out JsonElement lat) ||
+                        !point.TryGetProperty("lon", out JsonElement lon))
                     {
                         continue;
                     }
 
-                    result.Add(point);
+                    var current = new CoastlinePoint
+                    {
+                        Latitude = lat.GetDouble(),
+                        Longitude = lon.GetDouble()
+                    };
+
+                    if (previous != null)
+                        graph.AddEdge(previous, current);
+
+                    previous = current;
                 }
             }
 
-            return result;
+            return graph;
         }
 
-        private static List<CoastlinePoint> LimitPoints(
+        private static List<CoastlinePoint> Densify(
             List<CoastlinePoint> points,
-            int maximum,
+            double maxSegmentNm,
+            int maxPoints,
             bool closed)
         {
-            if (points.Count <= maximum)
+            if (points.Count < 2)
                 return points;
 
-            int step =
-                (int)Math.Ceiling(
-                    points.Count /
-                    (double)maximum);
+            var result = new List<CoastlinePoint>();
 
-            List<CoastlinePoint> result =
-                points
-                    .Where(
-                        (_, index) =>
-                            index % step == 0)
-                    .ToList();
+            int segmentCount = closed ? points.Count : points.Count - 1;
+            if (closed && DistanceNm(points[0], points[^1]) < 0.02)
+                segmentCount = points.Count - 1;
 
-            if (!closed &&
-                DistanceNm(
-                    result[^1].Latitude,
-                    result[^1].Longitude,
-                    points[^1].Latitude,
-                    points[^1].Longitude) >
-                0.001)
+            for (int i = 0; i < segmentCount; i++)
             {
-                result.Add(
-                    points[^1]);
-            }
+                CoastlinePoint a = points[i];
+                CoastlinePoint b = points[(i + 1) % points.Count];
 
-            return result;
-        }
+                if (result.Count == 0)
+                    result.Add(Clone(a));
 
-        // =====================================================
-        // POLYGON HELPERS
-        // =====================================================
+                double distance = DistanceNm(a, b);
+                int sections = Math.Max(1, (int)Math.Ceiling(distance / maxSegmentNm));
 
-        private static void EnsureClosed(
-            List<CoastlinePoint> points)
-        {
-            if (points.Count < 2)
-                return;
-
-            if (DistanceNm(
-                    points[0].Latitude,
-                    points[0].Longitude,
-                    points[^1].Latitude,
-                    points[^1].Longitude) <
-                0.001)
-            {
-                return;
-            }
-
-            points.Add(
-                new CoastlinePoint
+                for (int s = 1; s <= sections; s++)
                 {
-                    Latitude =
-                        points[0].Latitude,
-
-                    Longitude =
-                        points[0].Longitude
-                });
-        }
-
-        private static List<CoastlinePoint>
-            RemoveDuplicateClosure(
-                List<CoastlinePoint> points)
-        {
-            var result =
-                new List<CoastlinePoint>(
-                    points);
-
-            if (result.Count > 2 &&
-                DistanceNm(
-                    result[0].Latitude,
-                    result[0].Longitude,
-                    result[^1].Latitude,
-                    result[^1].Longitude) <
-                0.001)
-            {
-                result.RemoveAt(
-                    result.Count - 1);
-            }
-
-            return result;
-        }
-
-        private static double SignedPolygonArea(
-            List<CoastlinePoint> points)
-        {
-            if (points.Count < 3)
-                return 0;
-
-            double centreLatitude =
-                points.Average(
-                    p => p.Latitude);
-
-            double cos =
-                Math.Cos(
-                    centreLatitude *
-                    Math.PI /
-                    180.0);
-
-            double area =
-                0;
-
-            for (int i = 0;
-                 i < points.Count;
-                 i++)
-            {
-                CoastlinePoint first =
-                    points[i];
-
-                CoastlinePoint second =
-                    points[
-                        (i + 1) %
-                        points.Count];
-
-                double x1 =
-                    first.Longitude *
-                    cos;
-
-                double y1 =
-                    first.Latitude;
-
-                double x2 =
-                    second.Longitude *
-                    cos;
-
-                double y2 =
-                    second.Latitude;
-
-                area +=
-                    x1 * y2 -
-                    x2 * y1;
-            }
-
-            return area / 2.0;
-        }
-
-        private static double AbsolutePolygonArea(
-            List<CoastlinePoint> points)
-        {
-            return Math.Abs(
-                SignedPolygonArea(
-                    RemoveDuplicateClosure(
-                        points)));
-        }
-
-        private static int FindFarthestPointIndex(
-            List<CoastlinePoint> points,
-            int originIndex)
-        {
-            int bestIndex =
-                originIndex;
-
-            double bestDistance =
-                -1;
-
-            CoastlinePoint origin =
-                points[originIndex];
-
-            for (int i = 0;
-                 i < points.Count;
-                 i++)
-            {
-                double distance =
-                    DistanceNm(
-                        origin.Latitude,
-                        origin.Longitude,
-                        points[i].Latitude,
-                        points[i].Longitude);
-
-                if (distance >
-                    bestDistance)
-                {
-                    bestDistance =
-                        distance;
-
-                    bestIndex =
-                        i;
+                    double f = s / (double)sections;
+                    result.Add(new CoastlinePoint
+                    {
+                        Latitude = a.Latitude + (b.Latitude - a.Latitude) * f,
+                        Longitude = a.Longitude + (b.Longitude - a.Longitude) * f
+                    });
                 }
             }
 
-            return bestIndex;
-        }
+            if (closed && DistanceNm(result[0], result[^1]) >= 0.02)
+                result.Add(Clone(result[0]));
 
-        private static int FindNearestPointIndex(
-            List<CoastlinePoint> points,
-            double latitude,
-            double longitude)
-        {
-            int bestIndex =
-                -1;
+            if (result.Count <= maxPoints)
+                return result;
 
-            double bestDistance =
-                double.MaxValue;
+            // Keep the complete shape while reducing uniformly only when Little
+            // Navmap would otherwise receive an extreme number of points.
+            double ratio = result.Count / (double)maxPoints;
+            var reduced = new List<CoastlinePoint>(maxPoints + 1);
 
-            for (int i = 0;
-                 i < points.Count;
-                 i++)
+            for (int i = 0; i < maxPoints; i++)
             {
-                double distance =
-                    DistanceNm(
-                        latitude,
-                        longitude,
-                        points[i].Latitude,
-                        points[i].Longitude);
-
-                if (distance <
-                    bestDistance)
-                {
-                    bestDistance =
-                        distance;
-
-                    bestIndex =
-                        i;
-                }
+                int index = Math.Min(result.Count - 1, (int)Math.Floor(i * ratio));
+                reduced.Add(Clone(result[index]));
             }
 
-            return bestIndex;
+            if (!closed)
+                reduced[^1] = Clone(result[^1]);
+            else if (DistanceNm(reduced[0], reduced[^1]) >= 0.02)
+                reduced.Add(Clone(reduced[0]));
+
+            return reduced;
         }
 
-        private static double DistanceToOutlineNm(
-            double latitude,
-            double longitude,
-            List<CoastlinePoint> points)
+        private static CoastlinePoint Clone(CoastlinePoint p) =>
+            new CoastlinePoint { Latitude = p.Latitude, Longitude = p.Longitude };
+
+        private static void ExpandBoundingBox(
+            ref double south,
+            ref double north,
+            ref double west,
+            ref double east,
+            double factor,
+            double minimumDegrees)
         {
-            double best =
-                double.MaxValue;
+            double latSpan = Math.Max(minimumDegrees, north - south);
+            double lonSpan = Math.Max(minimumDegrees, east - west);
 
-            foreach (CoastlinePoint point
-                in points)
-            {
-                best =
-                    Math.Min(
-                        best,
-                        DistanceNm(
-                            latitude,
-                            longitude,
-                            point.Latitude,
-                            point.Longitude));
-            }
-
-            return best;
+            south -= latSpan * factor + minimumDegrees;
+            north += latSpan * factor + minimumDegrees;
+            west -= lonSpan * factor + minimumDegrees;
+            east += lonSpan * factor + minimumDegrees;
         }
 
-        private static double ChainLengthNm(
-            List<CoastlinePoint> points)
-        {
-            double total =
-                0;
+        private static bool IsTemporaryFailure(HttpStatusCode statusCode) =>
+            statusCode == HttpStatusCode.RequestTimeout ||
+            (int)statusCode == 429 ||
+            statusCode == HttpStatusCode.BadGateway ||
+            statusCode == HttpStatusCode.ServiceUnavailable ||
+            statusCode == HttpStatusCode.GatewayTimeout;
 
-            for (int i = 1;
-                 i < points.Count;
-                 i++)
-            {
-                total +=
-                    DistanceNm(
-                        points[i - 1].Latitude,
-                        points[i - 1].Longitude,
-                        points[i].Latitude,
-                        points[i].Longitude);
-            }
-
-            return total;
-        }
-
-        // =====================================================
-        // GEOGRAPHIC MATHS
-        // =====================================================
-
-        private static double PerpendicularDistanceNm(
-            CoastlinePoint point,
-            CoastlinePoint lineStart,
-            CoastlinePoint lineEnd)
-        {
-            double referenceLatitude =
-                (lineStart.Latitude +
-                 lineEnd.Latitude +
-                 point.Latitude) /
-                3.0;
-
-            double cos =
-                Math.Cos(
-                    referenceLatitude *
-                    Math.PI /
-                    180.0);
-
-            double x =
-                point.Longitude *
-                60.0 *
-                cos;
-
-            double y =
-                point.Latitude *
-                60.0;
-
-            double x1 =
-                lineStart.Longitude *
-                60.0 *
-                cos;
-
-            double y1 =
-                lineStart.Latitude *
-                60.0;
-
-            double x2 =
-                lineEnd.Longitude *
-                60.0 *
-                cos;
-
-            double y2 =
-                lineEnd.Latitude *
-                60.0;
-
-            double dx =
-                x2 - x1;
-
-            double dy =
-                y2 - y1;
-
-            if (Math.Abs(dx) <
-                    0.0000001 &&
-                Math.Abs(dy) <
-                    0.0000001)
-            {
-                return Math.Sqrt(
-                    Math.Pow(
-                        x - x1,
-                        2) +
-                    Math.Pow(
-                        y - y1,
-                        2));
-            }
-
-            double t =
-                ((x - x1) * dx +
-                 (y - y1) * dy) /
-                (dx * dx +
-                 dy * dy);
-
-            t =
-                Math.Max(
-                    0,
-                    Math.Min(
-                        1,
-                        t));
-
-            double nearestX =
-                x1 +
-                t * dx;
-
-            double nearestY =
-                y1 +
-                t * dy;
-
-            return Math.Sqrt(
-                Math.Pow(
-                    x - nearestX,
-                    2) +
-                Math.Pow(
-                    y - nearestY,
-                    2));
-        }
-
-        private static CoastlinePoint DestinationPoint(
-            CoastlinePoint origin,
-            double bearingDegrees,
-            double distanceNm)
-        {
-            const double EarthRadiusNm =
-                3440.065;
-
-            double angularDistance =
-                distanceNm /
-                EarthRadiusNm;
-
-            double bearing =
-                bearingDegrees *
-                Math.PI /
-                180.0;
-
-            double latitude1 =
-                origin.Latitude *
-                Math.PI /
-                180.0;
-
-            double longitude1 =
-                origin.Longitude *
-                Math.PI /
-                180.0;
-
-            double latitude2 =
-                Math.Asin(
-                    Math.Sin(latitude1) *
-                    Math.Cos(angularDistance) +
-                    Math.Cos(latitude1) *
-                    Math.Sin(angularDistance) *
-                    Math.Cos(bearing));
-
-            double longitude2 =
-                longitude1 +
-                Math.Atan2(
-                    Math.Sin(bearing) *
-                    Math.Sin(angularDistance) *
-                    Math.Cos(latitude1),
-
-                    Math.Cos(angularDistance) -
-                    Math.Sin(latitude1) *
-                    Math.Sin(latitude2));
-
-            return new CoastlinePoint
-            {
-                Latitude =
-                    latitude2 *
-                    180.0 /
-                    Math.PI,
-
-                Longitude =
-                    longitude2 *
-                    180.0 /
-                    Math.PI
-            };
-        }
-
-        private static double BearingDegrees(
-            double latitude1,
-            double longitude1,
-            double latitude2,
-            double longitude2)
-        {
-            double lat1 =
-                latitude1 *
-                Math.PI /
-                180.0;
-
-            double lat2 =
-                latitude2 *
-                Math.PI /
-                180.0;
-
-            double deltaLongitude =
-                (longitude2 -
-                 longitude1) *
-                Math.PI /
-                180.0;
-
-            double y =
-                Math.Sin(
-                    deltaLongitude) *
-                Math.Cos(
-                    lat2);
-
-            double x =
-                Math.Cos(lat1) *
-                Math.Sin(lat2) -
-                Math.Sin(lat1) *
-                Math.Cos(lat2) *
-                Math.Cos(
-                    deltaLongitude);
-
-            return NormalizeBearing(
-                Math.Atan2(
-                    y,
-                    x) *
-                180.0 /
-                Math.PI);
-        }
-
-        private static double NormalizeBearing(
-            double bearing)
-        {
-            bearing %=
-                360.0;
-
-            if (bearing < 0)
-                bearing += 360.0;
-
-            return bearing;
-        }
+        private static double DistanceNm(CoastlinePoint a, CoastlinePoint b) =>
+            DistanceNm(a.Latitude, a.Longitude, b.Latitude, b.Longitude);
 
         private static double DistanceNm(
             double latitude1,
@@ -1639,56 +381,296 @@ namespace H145FlightPlanner.Services
             double latitude2,
             double longitude2)
         {
-            const double EarthRadiusNm =
-                3440.065;
+            const double earthRadiusNm = 3440.065;
+            double lat1 = latitude1 * Math.PI / 180.0;
+            double lat2 = latitude2 * Math.PI / 180.0;
+            double dLat = (latitude2 - latitude1) * Math.PI / 180.0;
+            double dLon = (longitude2 - longitude1) * Math.PI / 180.0;
 
-            double lat1 =
-                latitude1 *
-                Math.PI /
-                180.0;
+            double a = Math.Sin(dLat / 2) * Math.Sin(dLat / 2) +
+                       Math.Cos(lat1) * Math.Cos(lat2) *
+                       Math.Sin(dLon / 2) * Math.Sin(dLon / 2);
 
-            double lat2 =
-                latitude2 *
-                Math.PI /
-                180.0;
+            return earthRadiusNm * 2.0 *
+                   Math.Atan2(Math.Sqrt(a), Math.Sqrt(1.0 - a));
+        }
 
-            double deltaLatitude =
-                (latitude2 -
-                 latitude1) *
-                Math.PI /
-                180.0;
+        private sealed class LandEdgeGraph
+        {
+            private readonly List<Vertex> _vertices = new();
+            private readonly Dictionary<string, int> _vertexByKey = new();
 
-            double deltaLongitude =
-                (longitude2 -
-                 longitude1) *
-                Math.PI /
-                180.0;
+            public int VertexCount => _vertices.Count;
 
-            double a =
-                Math.Sin(
-                    deltaLatitude /
-                    2.0) *
-                Math.Sin(
-                    deltaLatitude /
-                    2.0) +
-                Math.Cos(lat1) *
-                Math.Cos(lat2) *
-                Math.Sin(
-                    deltaLongitude /
-                    2.0) *
-                Math.Sin(
-                    deltaLongitude /
-                    2.0);
+            public void AddEdge(CoastlinePoint a, CoastlinePoint b)
+            {
+                int ia = GetOrAdd(a);
+                int ib = GetOrAdd(b);
+                if (ia == ib)
+                    return;
 
-            double c =
-                2.0 *
-                Math.Atan2(
-                    Math.Sqrt(a),
-                    Math.Sqrt(
-                        1.0 - a));
+                double weight = DistanceNm(a, b);
+                AddNeighbour(ia, ib, weight);
+                AddNeighbour(ib, ia, weight);
+            }
 
-            return EarthRadiusNm *
-                   c;
+            public List<int> GetComponentNearest(double latitude, double longitude)
+            {
+                int start = FindNearestVertex(latitude, longitude);
+                if (start < 0)
+                    return new List<int>();
+
+                var result = new List<int>();
+                var queue = new Queue<int>();
+                var visited = new HashSet<int>();
+
+                queue.Enqueue(start);
+                visited.Add(start);
+
+                while (queue.Count > 0)
+                {
+                    int current = queue.Dequeue();
+                    result.Add(current);
+
+                    foreach (Edge edge in _vertices[current].Edges)
+                    {
+                        if (visited.Add(edge.To))
+                            queue.Enqueue(edge.To);
+                    }
+                }
+
+                return result;
+            }
+
+            public List<CoastlinePoint> FindBestConnectedPath(
+                double startLatitude,
+                double startLongitude,
+                double endLatitude,
+                double endLongitude)
+            {
+                int[] starts = FindNearestVertices(startLatitude, startLongitude, 24);
+                int[] ends = FindNearestVertices(endLatitude, endLongitude, 24);
+
+                double bestScore = double.MaxValue;
+                List<int>? bestPath = null;
+
+                foreach (int start in starts)
+                {
+                    (double[] dist, int[] previous) = Dijkstra(start);
+
+                    foreach (int end in ends)
+                    {
+                        if (double.IsInfinity(dist[end]))
+                            continue;
+
+                        double joinStart = DistanceNm(
+                            startLatitude, startLongitude,
+                            _vertices[start].Point.Latitude,
+                            _vertices[start].Point.Longitude);
+
+                        double joinEnd = DistanceNm(
+                            endLatitude, endLongitude,
+                            _vertices[end].Point.Latitude,
+                            _vertices[end].Point.Longitude);
+
+                        double score = joinStart + dist[end] + joinEnd;
+
+                        if (score < bestScore)
+                        {
+                            bestScore = score;
+                            bestPath = ReconstructPath(start, end, previous);
+                        }
+                    }
+                }
+
+                if (bestPath == null || bestPath.Count < 2)
+                    return new List<CoastlinePoint>();
+
+                return bestPath.Select(i => Clone(_vertices[i].Point)).ToList();
+            }
+
+            public List<CoastlinePoint> TryBuildClosedLoop(
+                List<int> component,
+                double targetLatitude,
+                double targetLongitude)
+            {
+                var componentSet = component.ToHashSet();
+                List<int> degreeTwo = component
+                    .Where(i => _vertices[i].Edges.Count(e => componentSet.Contains(e.To)) == 2)
+                    .ToList();
+
+                if (degreeTwo.Count < 3)
+                    return new List<CoastlinePoint>();
+
+                int start = degreeTwo
+                    .OrderBy(i => DistanceNm(
+                        targetLatitude, targetLongitude,
+                        _vertices[i].Point.Latitude,
+                        _vertices[i].Point.Longitude))
+                    .First();
+
+                var path = new List<int> { start };
+                int previous = -1;
+                int current = start;
+
+                for (int guard = 0; guard < component.Count + 10; guard++)
+                {
+                    List<int> neighbours = _vertices[current].Edges
+                        .Select(e => e.To)
+                        .Where(componentSet.Contains)
+                        .Distinct()
+                        .ToList();
+
+                    int next = neighbours.FirstOrDefault(n => n != previous, -1);
+                    if (next < 0)
+                        return new List<CoastlinePoint>();
+
+                    if (next == start)
+                    {
+                        path.Add(start);
+                        return path.Select(i => Clone(_vertices[i].Point)).ToList();
+                    }
+
+                    if (path.Contains(next))
+                        return new List<CoastlinePoint>();
+
+                    path.Add(next);
+                    previous = current;
+                    current = next;
+                }
+
+                return new List<CoastlinePoint>();
+            }
+
+            public List<CoastlinePoint> BuildLongestDetailedPath(List<int> component)
+            {
+                if (component.Count < 2)
+                    return new List<CoastlinePoint>();
+
+                var set = component.ToHashSet();
+                List<int> ends = component
+                    .Where(i => _vertices[i].Edges.Count(e => set.Contains(e.To)) <= 1)
+                    .ToList();
+
+                int start = ends.Count > 0 ? ends[0] : component[0];
+                (double[] firstDistances, _) = DijkstraRestricted(start, set);
+                int farA = component.OrderByDescending(i => firstDistances[i]).First();
+
+                (double[] secondDistances, int[] previous) = DijkstraRestricted(farA, set);
+                int farB = component.OrderByDescending(i => secondDistances[i]).First();
+
+                List<int> path = ReconstructPath(farA, farB, previous);
+                return path.Select(i => Clone(_vertices[i].Point)).ToList();
+            }
+
+            private int GetOrAdd(CoastlinePoint point)
+            {
+                string key = Key(point);
+                if (_vertexByKey.TryGetValue(key, out int index))
+                    return index;
+
+                index = _vertices.Count;
+                _vertices.Add(new Vertex { Point = Clone(point) });
+                _vertexByKey[key] = index;
+                return index;
+            }
+
+            private static string Key(CoastlinePoint point) =>
+                $"{Math.Round(point.Latitude, 6):F6},{Math.Round(point.Longitude, 6):F6}";
+
+            private void AddNeighbour(int from, int to, double weight)
+            {
+                if (_vertices[from].Edges.Any(e => e.To == to))
+                    return;
+                _vertices[from].Edges.Add(new Edge { To = to, Weight = weight });
+            }
+
+            private int FindNearestVertex(double latitude, double longitude) =>
+                FindNearestVertices(latitude, longitude, 1).FirstOrDefault(-1);
+
+            private int[] FindNearestVertices(double latitude, double longitude, int count) =>
+                _vertices
+                    .Select((v, i) => new
+                    {
+                        Index = i,
+                        Distance = DistanceNm(
+                            latitude, longitude,
+                            v.Point.Latitude, v.Point.Longitude)
+                    })
+                    .OrderBy(x => x.Distance)
+                    .Take(Math.Min(count, _vertices.Count))
+                    .Select(x => x.Index)
+                    .ToArray();
+
+            private (double[] Distances, int[] Previous) Dijkstra(int start)
+            {
+                var allowed = Enumerable.Range(0, _vertices.Count).ToHashSet();
+                return DijkstraRestricted(start, allowed);
+            }
+
+            private (double[] Distances, int[] Previous) DijkstraRestricted(
+                int start,
+                HashSet<int> allowed)
+            {
+                double[] distance = Enumerable.Repeat(double.PositiveInfinity, _vertices.Count).ToArray();
+                int[] previous = Enumerable.Repeat(-1, _vertices.Count).ToArray();
+                var queue = new PriorityQueue<int, double>();
+
+                distance[start] = 0;
+                queue.Enqueue(start, 0);
+
+                while (queue.Count > 0)
+                {
+                    queue.TryDequeue(out int current, out double queuedDistance);
+                    if (queuedDistance > distance[current])
+                        continue;
+
+                    foreach (Edge edge in _vertices[current].Edges)
+                    {
+                        if (!allowed.Contains(edge.To))
+                            continue;
+
+                        double candidate = distance[current] + edge.Weight;
+                        if (candidate >= distance[edge.To])
+                            continue;
+
+                        distance[edge.To] = candidate;
+                        previous[edge.To] = current;
+                        queue.Enqueue(edge.To, candidate);
+                    }
+                }
+
+                return (distance, previous);
+            }
+
+            private static List<int> ReconstructPath(int start, int end, int[] previous)
+            {
+                var path = new List<int>();
+                int current = end;
+
+                while (current >= 0)
+                {
+                    path.Add(current);
+                    if (current == start)
+                        break;
+                    current = previous[current];
+                }
+
+                path.Reverse();
+                return path.Count > 0 && path[0] == start ? path : new List<int>();
+            }
+
+            private sealed class Vertex
+            {
+                public CoastlinePoint Point { get; set; } = new();
+                public List<Edge> Edges { get; set; } = new();
+            }
+
+            private sealed class Edge
+            {
+                public int To { get; set; }
+                public double Weight { get; set; }
+            }
         }
     }
 }
