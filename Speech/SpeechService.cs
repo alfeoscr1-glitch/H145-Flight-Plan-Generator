@@ -39,6 +39,35 @@ namespace H145FlightPlanner.Speech
                     speechConfig,
                     audioConfig);
 
+                var phraseList =
+                    PhraseListGrammar.FromRecognizer(_recognizer);
+
+                phraseList.SetWeight(2.0);
+
+                phraseList.AddPhrase("EGCK");
+                phraseList.AddPhrase("EGFA");
+                phraseList.AddPhrase("EGPH");
+                phraseList.AddPhrase("EGFF");
+                phraseList.AddPhrase("EGNT");
+                phraseList.AddPhrase("EGPB");
+
+                phraseList.AddPhrase("H145");
+                phraseList.AddPhrase("Little Navmap");
+                phraseList.AddPhrase("flight plan");
+                phraseList.AddPhrase("departure");
+                phraseList.AddPhrase("destination");
+                phraseList.AddPhrase("direct");
+                phraseList.AddPhrase("orbit");
+                phraseList.AddPhrase("coastline");
+                phraseList.AddPhrase("coastal route");
+                phraseList.AddPhrase("fly around");
+                phraseList.AddPhrase("scenic route");
+
+                phraseList.AddPhrase("Anglesey");
+                phraseList.AddPhrase("Fishguard");
+                phraseList.AddPhrase("Pembrokeshire");
+                phraseList.AddPhrase("Aberystwyth");
+
                 _recognizer.Recognized += Recognizer_Recognized;
 
                 await _recognizer.StartContinuousRecognitionAsync();
