@@ -30,7 +30,6 @@ namespace H145FlightPlanner
 
         private readonly DirectRouteGenerator _directRouteGenerator;
         private readonly OrbitRouteGenerator _orbitRouteGenerator;
-        private readonly AroundRouteGenerator _aroundRouteGenerator;
 
         private readonly TextBox _commandBox;
         private readonly Button _microphoneButton;
@@ -64,11 +63,6 @@ namespace H145FlightPlanner
 
             _orbitRouteGenerator =
                 new OrbitRouteGenerator(
-                    _airportService,
-                    _geographyService);
-
-            _aroundRouteGenerator =
-                new AroundRouteGenerator(
                     _airportService,
                     _geographyService);
 
@@ -753,20 +747,6 @@ namespace H145FlightPlanner
                 {
                     _currentFlightPlan =
                         await _orbitRouteGenerator.GenerateAsync(
-                            request);
-                }
-
-                // ---------------------------------------------
-                // AROUND
-                // ---------------------------------------------
-
-                else if (string.Equals(
-                    request.RouteType,
-                    "AROUND",
-                    StringComparison.OrdinalIgnoreCase))
-                {
-                    _currentFlightPlan =
-                        await _aroundRouteGenerator.GenerateAsync(
                             request);
                 }
 
