@@ -30,10 +30,6 @@ namespace H145FlightPlanner.Logic
                     icaoCodes[0];
             }
 
-            // -------------------------------------------------
-            // ORBIT
-            // -------------------------------------------------
-
             if (string.Equals(
                 request.RouteType,
                 "ORBIT",
@@ -42,23 +38,13 @@ namespace H145FlightPlanner.Logic
                 request.OrbitLocation =
                     ExtractOrbitLocation(text);
 
-                // Example:
-                // EGCK -> orbit EGFD -> return EGCK
-                //
-                // Departure = EGCK
-                // OrbitLocation = EGFD
-                // ReturnLocation = EGCK
+                string? orbitIcao =
+                    ExtractOrbitIcao(text);
 
-                if (icaoCodes.Count >= 2)
+                if (!string.IsNullOrWhiteSpace(orbitIcao))
                 {
-                    string? orbitIcao =
-                        ExtractOrbitIcao(text);
-
-                    if (!string.IsNullOrWhiteSpace(orbitIcao))
-                    {
-                        request.OrbitLocation =
-                            orbitIcao;
-                    }
+                    request.OrbitLocation =
+                        orbitIcao;
                 }
 
                 string returnIcao =
@@ -69,38 +55,40 @@ namespace H145FlightPlanner.Logic
                     request.ReturnLocation =
                         returnIcao;
                 }
-                else if (icaoCodes.Count >= 3)
-                {
-                    request.ReturnLocation =
-                        icaoCodes[^1];
-                }
-
-                // If the spoken command says "return"
-                // but does not repeat an ICAO, return
-                // to the departure airport.
-                if (ContainsReturnInstruction(text) &&
-                    string.IsNullOrWhiteSpace(
-                        request.ReturnLocation))
+                else if (ContainsReturnInstruction(text))
                 {
                     request.ReturnLocation =
                         request.Departure;
                 }
 
-                // Orbit mode does not need a normal
-                // destination unless the user explicitly
-                // continues to another airport.
                 request.Destination =
                     ExtractContinueDestination(text);
-
-                // If no separate destination exists,
-                // the final airport will be ReturnLocation
-                // or departure in OrbitRouteGenerator.
             }
+            else if (string.Equals(
+                request.RouteType,
+                "AROUND",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                request.AroundLocation =
+                    ExtractAroundLocation(text);
 
-            // -------------------------------------------------
-            // DIRECT
-            // -------------------------------------------------
+                string returnIcao =
+                    ExtractReturnIcao(text);
 
+                if (!string.IsNullOrWhiteSpace(returnIcao))
+                {
+                    request.ReturnLocation =
+                        returnIcao;
+                }
+                else if (ContainsReturnInstruction(text))
+                {
+                    request.ReturnLocation =
+                        request.Departure;
+                }
+
+                request.Destination =
+                    ExtractContinueDestination(text);
+            }
             else if (string.Equals(
                 request.RouteType,
                 "DIRECT",
@@ -112,11 +100,6 @@ namespace H145FlightPlanner.Logic
                         icaoCodes[1];
                 }
             }
-
-            // -------------------------------------------------
-            // OTHER ROUTE TYPES
-            // -------------------------------------------------
-
             else
             {
                 if (icaoCodes.Count > 1)
@@ -129,7 +112,8 @@ namespace H145FlightPlanner.Logic
             request.RequestedLocations =
                 BuildRequestedLocations(
                     icaoCodes,
-                    request.OrbitLocation);
+                    request.OrbitLocation,
+                    request.AroundLocation);
 
             return request;
         }
@@ -137,7 +121,7 @@ namespace H145FlightPlanner.Logic
         private static string DetectRouteType(
             string text)
         {
-            // Orbit-specific wording.
+            // ORBIT
             if (Regex.IsMatch(
                 text,
                 @"\b(?:orbit|orbits|orbited|orbiting)\b",
@@ -162,7 +146,16 @@ namespace H145FlightPlanner.Logic
                 return "ORBIT";
             }
 
-            // Coastline mode.
+            // AROUND
+            if (Regex.IsMatch(
+                text,
+                @"\b(?:go\s+around|going\s+around|fly\s+around|flying\s+around|around|rounding|round)\b",
+                RegexOptions.IgnoreCase))
+            {
+                return "AROUND";
+            }
+
+            // COASTLINE
             if (Regex.IsMatch(
                 text,
                 @"\bcoast(?:line|al)?\b",
@@ -171,17 +164,16 @@ namespace H145FlightPlanner.Logic
                 return "COASTLINE";
             }
 
-            // Keep "fly around" for Scenic mode.
-            // It is deliberately NOT treated as Orbit.
+            // SCENIC
             if (Regex.IsMatch(
                 text,
-                @"\bscenic\b|\bsightseeing\b|\bfly\s+around\b",
+                @"\bscenic\b|\bsightseeing\b",
                 RegexOptions.IgnoreCase))
             {
                 return "SCENIC";
             }
 
-            // Explicit Direct phrases.
+            // DIRECT
             if (Regex.IsMatch(
                 text,
                 @"\b(?:direct|directly|directing|directed)\b",
@@ -198,7 +190,6 @@ namespace H145FlightPlanner.Logic
                 return "DIRECT";
             }
 
-            // A normal A-to-B flight is Direct by default.
             return "DIRECT";
         }
 
@@ -210,11 +201,6 @@ namespace H145FlightPlanner.Logic
                     text,
                     @"(?<![A-Za-z0-9])[A-Z]{4}(?![A-Za-z0-9])");
 
-            // Do NOT Distinct().
-            //
-            // We must keep repeated ICAOs so:
-            // EGCK -> orbit EGFD -> return EGCK
-            // retains both occurrences of EGCK.
             return matches
                 .Select(match =>
                     match.Value.ToUpperInvariant())
@@ -272,17 +258,6 @@ namespace H145FlightPlanner.Logic
         private static string ExtractOrbitLocation(
             string text)
         {
-            // Examples:
-            // orbit Aberystwyth
-            // orbiting Fishguard
-            // orbit Aberystwyth helipad
-            // circle around Birmingham
-            // circle over London
-            //
-            // Importantly, "helipad", "heliport",
-            // "airport", etc. remain part of the
-            // extracted location.
-
             Match match = Regex.Match(
                 text,
                 @"\b(?:orbit|orbits|orbited|orbiting|circle|circles|circled|circling)\b\s*(?:around\s+|over\s+)?(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bcontinue\b|\bproceed\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))",
@@ -294,18 +269,22 @@ namespace H145FlightPlanner.Logic
                     match.Groups["place"].Value);
             }
 
-            Match circuitMatch = Regex.Match(
+            return string.Empty;
+        }
+
+        private static string ExtractAroundLocation(
+            string text)
+        {
+            Match match = Regex.Match(
                 text,
-                @"\b(?:make|do)\s+(?:a\s+)?circuit\s+(?:around|over)\s+(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bcontinue\b|\bproceed\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))",
+                @"\b(?:go\s+around|going\s+around|fly\s+around|flying\s+around|around|rounding|round)\b\s+(?:the\s+)?(?<place>.+?)(?=\s*(?:,|\.|\bthen\b|\band\s+then\b|\breturn(?:ing)?\b|\bgo\s+back\b|\bhead\s+back\b|\bcontinue\b|\bproceed\b|\bat\s+\d|\b\d[\d,]*[\s-]*(?:feet|foot|ft)\b|\bVFR\b|\bIFR\b|$))",
                 RegexOptions.IgnoreCase);
 
-            if (circuitMatch.Success)
-            {
-                return CleanLocation(
-                    circuitMatch.Groups["place"].Value);
-            }
+            if (!match.Success)
+                return string.Empty;
 
-            return string.Empty;
+            return CleanLocation(
+                match.Groups["place"].Value);
         }
 
         private static string? ExtractOrbitIcao(
@@ -367,7 +346,8 @@ namespace H145FlightPlanner.Logic
 
         private static List<string> BuildRequestedLocations(
             List<string> icaoCodes,
-            string orbitLocation)
+            string orbitLocation,
+            string aroundLocation)
         {
             var locations =
                 new List<string>();
@@ -390,6 +370,16 @@ namespace H145FlightPlanner.Logic
             {
                 locations.Add(
                     orbitLocation);
+            }
+
+            if (!string.IsNullOrWhiteSpace(
+                aroundLocation) &&
+                !locations.Contains(
+                    aroundLocation,
+                    StringComparer.OrdinalIgnoreCase))
+            {
+                locations.Add(
+                    aroundLocation);
             }
 
             return locations;
