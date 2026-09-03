@@ -24,10 +24,13 @@ namespace H145FlightPlanner
     public class MainForm : Form
     {
         private readonly WhisperSpeechService _whisperService;
+
         private readonly AirportService _airportService;
         private readonly GeographyService _geographyService;
+
         private readonly DirectRouteGenerator _directRouteGenerator;
         private readonly OrbitRouteGenerator _orbitRouteGenerator;
+        private readonly AroundRouteGenerator _aroundRouteGenerator;
 
         private readonly TextBox _commandBox;
         private readonly Button _microphoneButton;
@@ -46,247 +49,600 @@ namespace H145FlightPlanner
 
         public MainForm()
         {
-            _whisperService = new WhisperSpeechService();
+            _whisperService =
+                new WhisperSpeechService();
 
-            _airportService = new AirportService();
-            _geographyService = new GeographyService();
+            _airportService =
+                new AirportService();
+
+            _geographyService =
+                new GeographyService();
 
             _directRouteGenerator =
-                new DirectRouteGenerator(_airportService);
+                new DirectRouteGenerator(
+                    _airportService);
 
             _orbitRouteGenerator =
                 new OrbitRouteGenerator(
                     _airportService,
                     _geographyService);
 
-            _whisperService.TranscriptionReceived += OnTranscriptionReceived;
-            _whisperService.StatusChanged += OnWhisperStatusChanged;
-            _whisperService.SpeechError += OnWhisperError;
+            _aroundRouteGenerator =
+                new AroundRouteGenerator(
+                    _airportService,
+                    _geographyService);
 
-            Text = "H145 Flight Plan Generator";
-            StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(1000, 700);
-            MinimumSize = new Size(900, 600);
-            BackColor = Color.FromArgb(240, 240, 240);
-            Font = new Font("Segoe UI", 10);
+            _whisperService.TranscriptionReceived +=
+                OnTranscriptionReceived;
 
-            Panel header = new Panel
-            {
-                Dock = DockStyle.Top,
-                Height = 105,
-                BackColor = Color.FromArgb(32, 32, 32)
-            };
+            _whisperService.StatusChanged +=
+                OnWhisperStatusChanged;
 
-            Label title = new Label
-            {
-                Text = "H145 FLIGHT PLAN GENERATOR",
-                ForeColor = Color.White,
-                Font = new Font("Segoe UI", 22, FontStyle.Bold),
-                AutoSize = true,
-                Location = new Point(30, 22)
-            };
+            _whisperService.SpeechError +=
+                OnWhisperError;
 
-            Label subtitle = new Label
-            {
-                Text = "Create helicopter flight plans for Little Navmap",
-                ForeColor = Color.LightGray,
-                Font = new Font("Segoe UI", 11),
-                AutoSize = true,
-                Location = new Point(32, 63)
-            };
+            Text =
+                "H145 Flight Plan Generator";
 
-            header.Controls.Add(title);
-            header.Controls.Add(subtitle);
+            StartPosition =
+                FormStartPosition.CenterScreen;
 
-            GroupBox commandGroup = new GroupBox
-            {
-                Text = "FLIGHT PLAN",
-                Location = new Point(25, 125),
-                Size = new Size(950, 205),
-                Font = new Font("Segoe UI", 10, FontStyle.Bold)
-            };
+            ClientSize =
+                new Size(1000, 700);
 
-            Label instruction = new Label
-            {
-                Text = "Tell the program what you would like to do:",
-                AutoSize = true,
-                Location = new Point(20, 35),
-                Font = new Font("Segoe UI", 10, FontStyle.Regular)
-            };
+            MinimumSize =
+                new Size(900, 600);
 
-            _commandBox = new TextBox
-            {
-                Multiline = true,
-                ScrollBars = ScrollBars.Vertical,
-                Location = new Point(20, 65),
-                Size = new Size(910, 70),
-                Font = new Font("Segoe UI", 11),
-                Anchor = AnchorStyles.Top |
-                         AnchorStyles.Left |
-                         AnchorStyles.Right,
-                PlaceholderText =
-                    "Type your flight plan here, or use the microphone..."
-            };
+            BackColor =
+                Color.FromArgb(
+                    240,
+                    240,
+                    240);
 
-            Button generateButton = new Button
-            {
-                Text = "GENERATE FLIGHT PLAN",
-                Location = new Point(20, 150),
-                Size = new Size(220, 38),
-                Font = new Font("Segoe UI", 10, FontStyle.Bold)
-            };
+            Font =
+                new Font(
+                    "Segoe UI",
+                    10);
 
-            generateButton.Click += GenerateButton_Click;
+            Panel header =
+                new Panel
+                {
+                    Dock =
+                        DockStyle.Top,
 
-            _microphoneButton = new Button
-            {
-                Text = "🎤 START SPEAKING",
-                Location = new Point(255, 150),
-                Size = new Size(190, 38),
-                Font = new Font("Segoe UI", 10, FontStyle.Bold)
-            };
+                    Height =
+                        105,
 
-            _microphoneButton.Click += MicrophoneButton_Click;
+                    BackColor =
+                        Color.FromArgb(
+                            32,
+                            32,
+                            32)
+                };
 
-            _microphoneStatus = new Label
-            {
-                Text = "Loading Whisper...",
-                AutoSize = true,
-                ForeColor = Color.DarkOrange,
-                Location = new Point(460, 161),
-                Font = new Font("Segoe UI", 9, FontStyle.Regular)
-            };
+            Label title =
+                new Label
+                {
+                    Text =
+                        "H145 FLIGHT PLAN GENERATOR",
 
-            commandGroup.Controls.Add(instruction);
-            commandGroup.Controls.Add(_commandBox);
-            commandGroup.Controls.Add(generateButton);
-            commandGroup.Controls.Add(_microphoneButton);
-            commandGroup.Controls.Add(_microphoneStatus);
+                    ForeColor =
+                        Color.White,
 
-            GroupBox routeGroup = new GroupBox
-            {
-                Text = "ROUTE INFORMATION",
-                Location = new Point(25, 345),
-                Size = new Size(950, 120),
-                Font = new Font("Segoe UI", 10, FontStyle.Bold)
-            };
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            22,
+                            FontStyle.Bold),
 
-            Label departureLabel = new Label
-            {
-                Text = "Departure:",
-                AutoSize = true,
-                Location = new Point(20, 35),
-                Font = new Font("Segoe UI", 10, FontStyle.Regular)
-            };
+                    AutoSize =
+                        true,
 
-            _departureValue = new Label
-            {
-                Text = "—",
-                AutoSize = true,
-                Location = new Point(120, 35),
-                Font = new Font("Segoe UI", 10, FontStyle.Bold)
-            };
+                    Location =
+                        new Point(
+                            30,
+                            22)
+                };
 
-            Label destinationLabel = new Label
-            {
-                Text = "Destination:",
-                AutoSize = true,
-                Location = new Point(330, 35),
-                Font = new Font("Segoe UI", 10, FontStyle.Regular)
-            };
+            Label subtitle =
+                new Label
+                {
+                    Text =
+                        "Create helicopter flight plans for Little Navmap",
 
-            _destinationValue = new Label
-            {
-                Text = "—",
-                AutoSize = true,
-                Location = new Point(440, 35),
-                Font = new Font("Segoe UI", 10, FontStyle.Bold)
-            };
+                    ForeColor =
+                        Color.LightGray,
 
-            Label routeTypeLabel = new Label
-            {
-                Text = "Route type:",
-                AutoSize = true,
-                Location = new Point(680, 35),
-                Font = new Font("Segoe UI", 10, FontStyle.Regular)
-            };
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            11),
 
-            _routeTypeValue = new Label
-            {
-                Text = "—",
-                AutoSize = true,
-                Location = new Point(775, 35),
-                Font = new Font("Segoe UI", 10, FontStyle.Bold)
-            };
+                    AutoSize =
+                        true,
 
-            routeGroup.Controls.Add(departureLabel);
-            routeGroup.Controls.Add(_departureValue);
-            routeGroup.Controls.Add(destinationLabel);
-            routeGroup.Controls.Add(_destinationValue);
-            routeGroup.Controls.Add(routeTypeLabel);
-            routeGroup.Controls.Add(_routeTypeValue);
+                    Location =
+                        new Point(
+                            32,
+                            63)
+                };
 
-            GroupBox outputGroup = new GroupBox
-            {
-                Text = "FLIGHT PLAN",
-                Location = new Point(25, 480),
-                Size = new Size(950, 190),
-                Font = new Font("Segoe UI", 10, FontStyle.Bold),
-                Anchor = AnchorStyles.Top |
-                         AnchorStyles.Bottom |
-                         AnchorStyles.Left |
-                         AnchorStyles.Right
-            };
+            header.Controls.Add(
+                title);
 
-            _flightPlanBox = new TextBox
-            {
-                Multiline = true,
-                ReadOnly = true,
-                ScrollBars = ScrollBars.Vertical,
-                Location = new Point(20, 35),
-                Size = new Size(910, 90),
-                Font = new Font("Consolas", 10),
-                Text = "No flight plan generated yet.",
-                Anchor = AnchorStyles.Top |
-                         AnchorStyles.Bottom |
-                         AnchorStyles.Left |
-                         AnchorStyles.Right
-            };
+            header.Controls.Add(
+                subtitle);
 
-            _exportButton = new Button
-            {
-                Text = "EXPORT TO LITTLE NAVMAP",
-                Location = new Point(20, 135),
-                Size = new Size(220, 38),
-                Enabled = false,
-                Font = new Font("Segoe UI", 10, FontStyle.Bold),
-                Anchor = AnchorStyles.Bottom |
-                         AnchorStyles.Left
-            };
+            GroupBox commandGroup =
+                new GroupBox
+                {
+                    Text =
+                        "FLIGHT PLAN",
 
-            _exportButton.Click += ExportButton_Click;
+                    Location =
+                        new Point(
+                            25,
+                            125),
 
-            outputGroup.Controls.Add(_flightPlanBox);
-            outputGroup.Controls.Add(_exportButton);
+                    Size =
+                        new Size(
+                            950,
+                            205),
 
-            Controls.Add(header);
-            Controls.Add(commandGroup);
-            Controls.Add(routeGroup);
-            Controls.Add(outputGroup);
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Bold)
+                };
 
-            Load += MainForm_Load;
-            FormClosing += MainForm_FormClosing;
+            Label instruction =
+                new Label
+                {
+                    Text =
+                        "Tell the program what you would like to do:",
+
+                    AutoSize =
+                        true,
+
+                    Location =
+                        new Point(
+                            20,
+                            35),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Regular)
+                };
+
+            _commandBox =
+                new TextBox
+                {
+                    Multiline =
+                        true,
+
+                    ScrollBars =
+                        ScrollBars.Vertical,
+
+                    Location =
+                        new Point(
+                            20,
+                            65),
+
+                    Size =
+                        new Size(
+                            910,
+                            70),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            11),
+
+                    Anchor =
+                        AnchorStyles.Top |
+                        AnchorStyles.Left |
+                        AnchorStyles.Right,
+
+                    PlaceholderText =
+                        "Type your flight plan here, or use the microphone..."
+                };
+
+            Button generateButton =
+                new Button
+                {
+                    Text =
+                        "GENERATE FLIGHT PLAN",
+
+                    Location =
+                        new Point(
+                            20,
+                            150),
+
+                    Size =
+                        new Size(
+                            220,
+                            38),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Bold)
+                };
+
+            generateButton.Click +=
+                GenerateButton_Click;
+
+            _microphoneButton =
+                new Button
+                {
+                    Text =
+                        "🎤 START SPEAKING",
+
+                    Location =
+                        new Point(
+                            255,
+                            150),
+
+                    Size =
+                        new Size(
+                            190,
+                            38),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Bold)
+                };
+
+            _microphoneButton.Click +=
+                MicrophoneButton_Click;
+
+            _microphoneStatus =
+                new Label
+                {
+                    Text =
+                        "Loading Whisper...",
+
+                    AutoSize =
+                        true,
+
+                    ForeColor =
+                        Color.DarkOrange,
+
+                    Location =
+                        new Point(
+                            460,
+                            161),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            9,
+                            FontStyle.Regular)
+                };
+
+            commandGroup.Controls.Add(
+                instruction);
+
+            commandGroup.Controls.Add(
+                _commandBox);
+
+            commandGroup.Controls.Add(
+                generateButton);
+
+            commandGroup.Controls.Add(
+                _microphoneButton);
+
+            commandGroup.Controls.Add(
+                _microphoneStatus);
+
+            GroupBox routeGroup =
+                new GroupBox
+                {
+                    Text =
+                        "ROUTE INFORMATION",
+
+                    Location =
+                        new Point(
+                            25,
+                            345),
+
+                    Size =
+                        new Size(
+                            950,
+                            120),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Bold)
+                };
+
+            Label departureLabel =
+                new Label
+                {
+                    Text =
+                        "Departure:",
+
+                    AutoSize =
+                        true,
+
+                    Location =
+                        new Point(
+                            20,
+                            35),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Regular)
+                };
+
+            _departureValue =
+                new Label
+                {
+                    Text =
+                        "—",
+
+                    AutoSize =
+                        true,
+
+                    Location =
+                        new Point(
+                            120,
+                            35),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Bold)
+                };
+
+            Label destinationLabel =
+                new Label
+                {
+                    Text =
+                        "Destination:",
+
+                    AutoSize =
+                        true,
+
+                    Location =
+                        new Point(
+                            330,
+                            35),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Regular)
+                };
+
+            _destinationValue =
+                new Label
+                {
+                    Text =
+                        "—",
+
+                    AutoSize =
+                        true,
+
+                    Location =
+                        new Point(
+                            440,
+                            35),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Bold)
+                };
+
+            Label routeTypeLabel =
+                new Label
+                {
+                    Text =
+                        "Route type:",
+
+                    AutoSize =
+                        true,
+
+                    Location =
+                        new Point(
+                            680,
+                            35),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Regular)
+                };
+
+            _routeTypeValue =
+                new Label
+                {
+                    Text =
+                        "—",
+
+                    AutoSize =
+                        true,
+
+                    Location =
+                        new Point(
+                            775,
+                            35),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Bold)
+                };
+
+            routeGroup.Controls.Add(
+                departureLabel);
+
+            routeGroup.Controls.Add(
+                _departureValue);
+
+            routeGroup.Controls.Add(
+                destinationLabel);
+
+            routeGroup.Controls.Add(
+                _destinationValue);
+
+            routeGroup.Controls.Add(
+                routeTypeLabel);
+
+            routeGroup.Controls.Add(
+                _routeTypeValue);
+
+            GroupBox outputGroup =
+                new GroupBox
+                {
+                    Text =
+                        "FLIGHT PLAN",
+
+                    Location =
+                        new Point(
+                            25,
+                            480),
+
+                    Size =
+                        new Size(
+                            950,
+                            190),
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Bold),
+
+                    Anchor =
+                        AnchorStyles.Top |
+                        AnchorStyles.Bottom |
+                        AnchorStyles.Left |
+                        AnchorStyles.Right
+                };
+
+            _flightPlanBox =
+                new TextBox
+                {
+                    Multiline =
+                        true,
+
+                    ReadOnly =
+                        true,
+
+                    ScrollBars =
+                        ScrollBars.Vertical,
+
+                    Location =
+                        new Point(
+                            20,
+                            35),
+
+                    Size =
+                        new Size(
+                            910,
+                            90),
+
+                    Font =
+                        new Font(
+                            "Consolas",
+                            10),
+
+                    Text =
+                        "No flight plan generated yet.",
+
+                    Anchor =
+                        AnchorStyles.Top |
+                        AnchorStyles.Bottom |
+                        AnchorStyles.Left |
+                        AnchorStyles.Right
+                };
+
+            _exportButton =
+                new Button
+                {
+                    Text =
+                        "EXPORT TO LITTLE NAVMAP",
+
+                    Location =
+                        new Point(
+                            20,
+                            135),
+
+                    Size =
+                        new Size(
+                            220,
+                            38),
+
+                    Enabled =
+                        false,
+
+                    Font =
+                        new Font(
+                            "Segoe UI",
+                            10,
+                            FontStyle.Bold),
+
+                    Anchor =
+                        AnchorStyles.Bottom |
+                        AnchorStyles.Left
+                };
+
+            _exportButton.Click +=
+                ExportButton_Click;
+
+            outputGroup.Controls.Add(
+                _flightPlanBox);
+
+            outputGroup.Controls.Add(
+                _exportButton);
+
+            Controls.Add(
+                header);
+
+            Controls.Add(
+                commandGroup);
+
+            Controls.Add(
+                routeGroup);
+
+            Controls.Add(
+                outputGroup);
+
+            Load +=
+                MainForm_Load;
+
+            FormClosing +=
+                MainForm_FormClosing;
         }
 
         private async void MainForm_Load(
             object? sender,
             EventArgs e)
         {
-            _microphoneButton.Enabled = false;
+            _microphoneButton.Enabled =
+                false;
 
             await _whisperService.InitializeAsync();
 
-            _microphoneButton.Enabled = true;
+            _microphoneButton.Enabled =
+                true;
         }
 
         private void MicrophoneButton_Click(
@@ -297,17 +653,21 @@ namespace H145FlightPlanner
             {
                 _whisperService.StopListening();
 
-                _isListening = false;
+                _isListening =
+                    false;
 
-                _microphoneButton.Text = "🎤 START SPEAKING";
+                _microphoneButton.Text =
+                    "🎤 START SPEAKING";
             }
             else
             {
                 _whisperService.StartListening();
 
-                _isListening = true;
+                _isListening =
+                    true;
 
-                _microphoneButton.Text = "🛑 STOP SPEAKING";
+                _microphoneButton.Text =
+                    "🛑 STOP SPEAKING";
             }
         }
 
@@ -317,7 +677,8 @@ namespace H145FlightPlanner
         {
             try
             {
-                string input = _commandBox.Text.Trim();
+                string input =
+                    _commandBox.Text.Trim();
 
                 if (string.IsNullOrWhiteSpace(input))
                 {
@@ -330,34 +691,46 @@ namespace H145FlightPlanner
                     return;
                 }
 
-                _currentFlightPlan = null;
-                _exportButton.Enabled = false;
+                _currentFlightPlan =
+                    null;
+
+                _exportButton.Enabled =
+                    false;
 
                 FlightPlanRequest request =
-                    FlightPlanCommandParser.Parse(input);
+                    FlightPlanCommandParser.Parse(
+                        input);
 
                 _departureValue.Text =
-                    string.IsNullOrWhiteSpace(request.Departure)
+                    string.IsNullOrWhiteSpace(
+                        request.Departure)
                         ? "—"
                         : request.Departure;
 
                 string displayedDestination =
-                    !string.IsNullOrWhiteSpace(request.ReturnLocation)
+                    !string.IsNullOrWhiteSpace(
+                        request.ReturnLocation)
                         ? request.ReturnLocation
                         : request.Destination;
 
                 _destinationValue.Text =
-                    string.IsNullOrWhiteSpace(displayedDestination)
+                    string.IsNullOrWhiteSpace(
+                        displayedDestination)
                         ? "—"
                         : displayedDestination;
 
                 _routeTypeValue.Text =
-                    string.IsNullOrWhiteSpace(request.RouteType)
+                    string.IsNullOrWhiteSpace(
+                        request.RouteType)
                         ? "—"
                         : request.RouteType;
 
                 _flightPlanBox.Text =
                     "Looking up locations and generating route...";
+
+                // ---------------------------------------------
+                // DIRECT
+                // ---------------------------------------------
 
                 if (string.Equals(
                     request.RouteType,
@@ -365,16 +738,42 @@ namespace H145FlightPlanner
                     StringComparison.OrdinalIgnoreCase))
                 {
                     _currentFlightPlan =
-                        await _directRouteGenerator.GenerateAsync(request);
+                        await _directRouteGenerator.GenerateAsync(
+                            request);
                 }
+
+                // ---------------------------------------------
+                // ORBIT
+                // ---------------------------------------------
+
                 else if (string.Equals(
                     request.RouteType,
                     "ORBIT",
                     StringComparison.OrdinalIgnoreCase))
                 {
                     _currentFlightPlan =
-                        await _orbitRouteGenerator.GenerateAsync(request);
+                        await _orbitRouteGenerator.GenerateAsync(
+                            request);
                 }
+
+                // ---------------------------------------------
+                // AROUND
+                // ---------------------------------------------
+
+                else if (string.Equals(
+                    request.RouteType,
+                    "AROUND",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    _currentFlightPlan =
+                        await _aroundRouteGenerator.GenerateAsync(
+                            request);
+                }
+
+                // ---------------------------------------------
+                // NOT IMPLEMENTED YET
+                // ---------------------------------------------
+
                 else
                 {
                     _flightPlanBox.Text =
@@ -386,15 +785,20 @@ namespace H145FlightPlanner
                 DisplayGeneratedFlightPlan(
                     _currentFlightPlan);
 
-                _exportButton.Enabled = true;
+                _exportButton.Enabled =
+                    true;
             }
             catch (Exception ex)
             {
-                _currentFlightPlan = null;
-                _exportButton.Enabled = false;
+                _currentFlightPlan =
+                    null;
+
+                _exportButton.Enabled =
+                    false;
 
                 _flightPlanBox.Text =
-                    $"Flight plan could not be generated.\r\n\r\n{ex.Message}";
+                    $"Flight plan could not be generated.\r\n\r\n" +
+                    ex.Message;
 
                 MessageBox.Show(
                     ex.Message,
@@ -407,7 +811,8 @@ namespace H145FlightPlanner
         private void DisplayGeneratedFlightPlan(
             GeneratedFlightPlan flightPlan)
         {
-            var output = new StringBuilder();
+            var output =
+                new StringBuilder();
 
             output.AppendLine(
                 $"Flight rules: {flightPlan.FlightRules}");
@@ -418,7 +823,8 @@ namespace H145FlightPlanner
 
             output.AppendLine();
 
-            output.AppendLine("Route:");
+            output.AppendLine(
+                "Route:");
 
             for (int i = 0;
                  i < flightPlan.Waypoints.Count;
@@ -430,7 +836,8 @@ namespace H145FlightPlanner
                 output.AppendLine(
                     $"{i + 1}. " +
                     $"{waypoint.Ident}" +
-                    (string.IsNullOrWhiteSpace(waypoint.Name)
+                    (string.IsNullOrWhiteSpace(
+                        waypoint.Name)
                         ? string.Empty
                         : $" - {waypoint.Name}"));
 
@@ -444,7 +851,8 @@ namespace H145FlightPlanner
                     $"   Alt: {waypoint.AltitudeFeet:F0} ft");
             }
 
-            _flightPlanBox.Text = output.ToString();
+            _flightPlanBox.Text =
+                output.ToString();
         }
 
         private void ExportButton_Click(
@@ -473,26 +881,36 @@ namespace H145FlightPlanner
                         _currentFlightPlan.Waypoints.Count - 1];
 
                 string defaultFileName =
-                    $"{departure.Ident} to {destination.Ident}.lnmpln";
+                    $"{departure.Ident} to " +
+                    $"{destination.Ident}.lnmpln";
 
-                using var saveDialog = new SaveFileDialog
+                using var saveDialog =
+                    new SaveFileDialog
+                    {
+                        Title =
+                            "Export Little Navmap Flight Plan",
+
+                        Filter =
+                            "Little Navmap Flight Plan (*.lnmpln)|*.lnmpln",
+
+                        DefaultExt =
+                            "lnmpln",
+
+                        AddExtension =
+                            true,
+
+                        FileName =
+                            defaultFileName,
+
+                        OverwritePrompt =
+                            true
+                    };
+
+                if (saveDialog.ShowDialog(this) !=
+                    DialogResult.OK)
                 {
-                    Title = "Export Little Navmap Flight Plan",
-
-                    Filter =
-                        "Little Navmap Flight Plan (*.lnmpln)|*.lnmpln",
-
-                    DefaultExt = "lnmpln",
-
-                    AddExtension = true,
-
-                    FileName = defaultFileName,
-
-                    OverwritePrompt = true
-                };
-
-                if (saveDialog.ShowDialog(this) != DialogResult.OK)
                     return;
+                }
 
                 LittleNavmapExporter.Export(
                     _currentFlightPlan,
@@ -522,35 +940,44 @@ namespace H145FlightPlanner
         {
             if (InvokeRequired)
             {
-                Invoke(new Action(() =>
-                    OnWhisperStatusChanged(sender, status)));
+                Invoke(
+                    new Action(
+                        () =>
+                            OnWhisperStatusChanged(
+                                sender,
+                                status)));
 
                 return;
             }
 
-            _microphoneStatus.Text = status;
+            _microphoneStatus.Text =
+                status;
 
             if (status.Contains(
                 "Listening",
                 StringComparison.OrdinalIgnoreCase))
             {
-                _microphoneStatus.ForeColor = Color.DarkRed;
+                _microphoneStatus.ForeColor =
+                    Color.DarkRed;
             }
             else if (status.Contains(
                 "Processing",
                 StringComparison.OrdinalIgnoreCase))
             {
-                _microphoneStatus.ForeColor = Color.DarkOrange;
+                _microphoneStatus.ForeColor =
+                    Color.DarkOrange;
             }
             else if (status.Contains(
                 "Ready",
                 StringComparison.OrdinalIgnoreCase))
             {
-                _microphoneStatus.ForeColor = Color.DarkGreen;
+                _microphoneStatus.ForeColor =
+                    Color.DarkGreen;
             }
             else
             {
-                _microphoneStatus.ForeColor = Color.DimGray;
+                _microphoneStatus.ForeColor =
+                    Color.DimGray;
             }
         }
 
@@ -560,8 +987,12 @@ namespace H145FlightPlanner
         {
             if (InvokeRequired)
             {
-                Invoke(new Action(() =>
-                    OnTranscriptionReceived(sender, text)));
+                Invoke(
+                    new Action(
+                        () =>
+                            OnTranscriptionReceived(
+                                sender,
+                                text)));
 
                 return;
             }
@@ -569,12 +1000,15 @@ namespace H145FlightPlanner
             if (string.IsNullOrWhiteSpace(text))
                 return;
 
-            if (!string.IsNullOrWhiteSpace(_commandBox.Text))
+            if (!string.IsNullOrWhiteSpace(
+                _commandBox.Text))
             {
-                _commandBox.AppendText(" ");
+                _commandBox.AppendText(
+                    " ");
             }
 
-            _commandBox.AppendText(text.Trim());
+            _commandBox.AppendText(
+                text.Trim());
 
             _commandBox.SelectionStart =
                 _commandBox.Text.Length;
@@ -588,16 +1022,24 @@ namespace H145FlightPlanner
         {
             if (InvokeRequired)
             {
-                Invoke(new Action(() =>
-                    OnWhisperError(sender, message)));
+                Invoke(
+                    new Action(
+                        () =>
+                            OnWhisperError(
+                                sender,
+                                message)));
 
                 return;
             }
 
-            _microphoneButton.Enabled = true;
+            _microphoneButton.Enabled =
+                true;
 
-            _microphoneStatus.Text = "Whisper error";
-            _microphoneStatus.ForeColor = Color.DarkRed;
+            _microphoneStatus.Text =
+                "Whisper error";
+
+            _microphoneStatus.ForeColor =
+                Color.DarkRed;
 
             MessageBox.Show(
                 message,
